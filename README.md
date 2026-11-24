@@ -1,4 +1,5 @@
 # Практическое использование Istio
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/4dd00711-a9af-43e5-806c-2d3d7d1024bb" />
 
 > Практический курс по эксплуатации Istio: от установки mesh до инцидентов, multicluster и ambient.
 
