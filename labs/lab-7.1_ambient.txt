@@ -1,0 +1,353 @@
+Лабораторная работа 7.1: Ambient: ztunnel, waypoint и миграция namespace
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        7. Sidecar и Ambient
+РАБОТА:        7.1
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline: Istio 1.25.2 Helm (ревизия 1-25), bookinfo с sidecar, ingress gateway
+               и classic Gateway работают, $INGRESS_HOST не пустой
+СОСТОЯНИЕ ПОСЛЕ: baseline восстановлен: Helm-установка с ревизией 1-25, bookinfo 2/2,
+               ingress gateway отвечает; Gateway API CRDs в кластере остаются
+СЛЕДУЮЩАЯ:     lab-8.1_incident.txt
+
+ЦЕЛИ РАБОТЫ
+  - Поставить Istio профилем ambient и увидеть, что sidecar'ов нет, а на узлах работает ztunnel.
+  - Перевести namespace bookinfo с sidecar на ambient и сравнить число контейнеров в подах.
+  - Включить waypoint и настроить L7-маршрутизацию HTTPRoute 90/10 между версиями reviews.
+  - Сформулировать ограничения ambient и вернуть стенд в baseline скриптом reset-istio.sh.
+
+ЧТО МЫ СДЕЛАЕМ
+  Переведём стенд из sidecar-режима в ambient: удалим Helm-установку Istio, поставим профиль
+  ambient, переключим namespace bookinfo на метку dataplane-mode и перезапустим поды.
+  Убедимся, что приложение доступно через Gateway API без единого sidecar'а, включим waypoint
+  для L7 и разделим трафик reviews 90/10 через HTTPRoute. В конце разберём ограничения
+  ambient и вернём стенд в baseline.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh и рабочий cluster-1 в baseline.
+  - Дистрибутив Istio 1.25.2 в ~/istio-1.25.2, istioctl в PATH через env.sh.
+  - MetalLB: Gateway API шлюз получит внешний IP.
+  - Интернет на admin: CRDs Gateway API скачиваются с github; reset-istio.sh на месте.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Стенд в sidecar-режиме:
+    k1 get pods -n bookinfo
+    k1 get namespace bookinfo --show-labels
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: поды bookinfo 2/2 (приложение и istio-proxy), на namespace метка
+  istio.io/rev=1-25, в istio-system — istiod и ingress/egress gateway. Метки
+  istio.io/dataplane-mode на namespace нет.
+
+  Приложение доступно снаружи:
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200. Если не 200 — стенд не в baseline: восстановите его reset-istio.sh
+  и повторите проверку.
+
+  Утилита waypoint доступна:
+    istioctl waypoint --help | head -5
+  ВЫ УВИДИТЕ: подкоманды apply, delete, generate, list, status.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  В sidecar-режиме каждый под получает контейнер istio-proxy. Это дорого: Envoy на каждый
+  под, перезапуск подов при обновлении mesh, отдельные сертификаты и соединения.
+
+  Ambient убирает sidecar из подов и делит работу между двумя компонентами.
+  ztunnel — лёгкий прокси на каждом узле (DaemonSet). Он берёт на себя L4: mTLS,
+  идентичность, простые политики и телеметрию соединений. Sidecar'ов в подах нет,
+  приложение видит ровно свои контейнеры.
+  waypoint — обычный Envoy, который включается по требованию для L7: маршрутизация,
+  ретраи, таймауты, заголовки, L7-политики. Waypoint включают на namespace, сервис
+  или отдельный под.
+
+  Включение namespace в ambient — это метка istio.io/dataplane-mode=ambient. С namespace
+  снимается ревизионная метка, а CNI при создании подов подключает их к ztunnel. Поэтому
+  после смены метки поды надо перезапустить: enrollment происходит при создании пода.
+
+  L7 настраивается через Kubernetes Gateway API: waypoint — это Gateway класса
+  istio-waypoint, маршруты — HTTPRoute. VirtualService с ambient официально Alpha,
+  смешивать его с Gateway API нельзя. Поэтому публикуем приложение Gateway API Gateway
+  класса istio, а L7-маршрутизацию делаем HTTPRoute.
+
+ШАГ 1. Фиксируем состояние sidecar-режима
+
+    k1 get pods -n bookinfo -l app=productpage \
+      -o jsonpath='{.items[0].spec.containers[*].name}'
+  ЗАЧЕМ: запомнить точку отсчёта. Здесь перечислены все контейнеры первого пода.
+  ВЫ УВИДИТЕ: два имени — приложение (например productpage) и istio-proxy.
+
+    k1 get namespace bookinfo --show-labels
+  ВЫ УВИДИТЕ: в LABELS только istio.io/rev=1-25 и kubernetes.io/metadata.name.
+
+    k1 get crd | grep -c istio.io
+  ВЫ УВИДИТЕ: число установленных Istio CRD, например 13-18. Они останутся при смене
+  установки — удалять их не нужно.
+
+ШАГ 2. Ставим Gateway API CRDs
+
+    curl -L -o ~/gateway-api-crds.yaml \
+      https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+    k1 apply -f ~/gateway-api-crds.yaml
+  ЗАЧЕМ: Gateway API — отдельный набор CRD. Он не входит ни в Kubernetes, ни в Istio.
+  Без него не создать ни waypoint, ни ingress-Gateway нового образца. Версия v1.2.1 —
+  та, с которой работает Istio 1.25.
+  ВЫ УВИДИТЕ: "customresourcedefinition.apiextensions.k8s.io/gateways.gateway.networking.k8s.io
+  created" и ещё несколько CRD.
+
+    k1 get crd | grep -c gateway.networking.k8s.io
+  ВЫ УВИДИТЕ: число от 5 до 8. Если ноль — манифест не скачался, см. разбор.
+
+ШАГ 3. Убираем старую установку Istio
+
+    helm --kubeconfig "$KUBECONFIG_CLUSTER1" uninstall istiod istio-ingress istio-base \
+      -n istio-system
+    k1 delete namespace istio-system --ignore-not-found
+  ЗАЧЕМ: профиль ambient ставится через istioctl и не должен конфликтовать с Helm-
+  релизами: иначе получатся два istiod с одним именем. CRD при этом сохраняются,
+  поэтому объекты Istio (Gateway, VirtualService) в bookinfo не пропадут.
+  ВЫ УВИДИТЕ: "release \"istiod\" uninstalled" для каждого релиза и сообщение об
+  удалении namespace.
+
+    k1 get pods -A | grep -c istio-system
+  ВЫ УВИДИТЕ: 0 — control plane удалён. С этого момента приложение снаружи недоступно:
+  это ожидаемое окно миграции, оно закроется на шаге 6.
+
+ШАГ 4. Ставим профиль ambient
+
+    istioctl install --set profile=ambient -y
+  ЗАЧЕМ: профиль ambient ставит istiod, ztunnel (DaemonSet на каждый узел) и CNI-плагин,
+  который подключает поды к ambient. Ingress gateway в профиль не входит — публиковать
+  приложение будем через Gateway API.
+  ВЫ УВИДИТЕ: "Installation complete" и строки об установленных компонентах.
+
+    k1 get pods -n istio-system
+    k1 get daemonset -n istio-system
+  ВЫ УВИДИТЕ: istiod 1/1 Running; DaemonSet ztunnel и istio-cni-node с DESIRED, равным
+  числу узлов, и READY столько же. ztunnel — это узел-прокси, заменивший sidecar.
+
+ШАГ 5. Переводим namespace bookinfo на ambient
+
+    k1 label namespace bookinfo istio.io/rev- istio.io/dataplane-mode=ambient
+  ЗАЧЕМ: снимаем ревизионную метку sidecar-инъекции и включаем ambient для namespace.
+  ВЫ УВИДИТЕ: "namespace/bookinfo labeled".
+
+    k1 rollout restart deployment -n bookinfo
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: enrollment в ambient происходит при создании пода: CNI видит метку namespace
+  и подключает под к ztunnel. Старые поды с sidecar'ом нужно пересоздать.
+  ВЫ УВИДИТЕ: "deployment.apps/... restarted" и "condition met" для каждого пода.
+
+    k1 get pods -n bookinfo -l app=productpage \
+      -o jsonpath='{.items[0].spec.containers[*].name}'
+  ВЫ УВИДИТЕ: только имя приложения. Контейнера istio-proxy больше нет.
+
+    k1 logs -n istio-system -l app=ztunnel --tail=10
+  ВЫ УВИДИТЕ: строки про принятые поды и обработанные соединения — ztunnel взял их в работу.
+
+ШАГ 6. Публикуем приложение через Gateway API
+
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/gateway-api/bookinfo-gateway.yaml -n bookinfo
+  ЗАЧЕМ: манифест создаёт Gateway класса istio (внешний вход) и HTTPRoute на productpage.
+  Istio сам развернёт под шлюза и сервис с типом LoadBalancer.
+  ВЫ УВИДИТЕ: "gateway.gateway.networking.k8s.io/bookinfo-gateway created" и
+  "httproute.gateway.networking.k8s.io/bookinfo created".
+
+    k1 wait --for=condition=Programmed gateway.gateway.networking.k8s.io/bookinfo-gateway \
+      -n bookinfo --timeout=180s
+  ВЫ УВИДИТЕ: "gateway.gateway.networking.k8s.io/bookinfo-gateway condition met".
+
+    GW_IP=$(k1 get svc -n bookinfo bookinfo-gateway-istio \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    echo "$GW_IP"
+  ЗАЧЕМ: в ambient нет istio-ingressgateway, поэтому $INGRESS_HOST пуст. Адрес берём
+  у Gateway API шлюза; это по-прежнему внешний IP MetalLB, не DNS кластера.
+  ВЫ УВИДИТЕ: IP из пула MetalLB. Если пусто — см. разбор ошибок.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$GW_IP/productpage"
+  ВЫ УВИДИТЕ: 200. Приложение работает без sidecar'ов: трафик от шлюза к поду обрабатывают
+  ztunnel'ы на узлах.
+
+ШАГ 7. Включаем waypoint для namespace
+
+    istioctl waypoint apply -n bookinfo --enroll-namespace
+  ЗАЧЕМ: ztunnel умеет только L4. Для L7 (маршрутизация по весам, заголовки, ретраи)
+  нужен waypoint — отдельный Envoy. Флаг --enroll-namespace сразу ставит на namespace
+  метку istio.io/use-waypoint, иначе трафик к waypoint не пойдёт.
+  ВЫ УВИДИТЕ: "waypoint bookinfo/waypoint applied" и "namespace bookinfo labeled with
+  "istio.io/use-waypoint: waypoint"".
+
+    k1 get pods -n bookinfo -l gateway.networking.k8s.io/gateway-name=waypoint
+    k1 get namespace bookinfo -L istio.io/use-waypoint
+  ВЫ УВИДИТЕ: под waypoint 1/1 Running; в колонке USE-WAYPOINT у namespace значение
+  waypoint.
+
+ШАГ 8. Настраиваем L7-маршрутизацию HTTPRoute 90/10
+
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/platform/kube/bookinfo-versions.yaml -n bookinfo
+  ЗАЧЕМ: HTTPRoute адресует backend'ы по именам сервисов, а в bookinfo сервис reviews
+  один на все версии. Файл создаёт сервисы reviews-v1, reviews-v2, reviews-v3, чтобы
+  маршрут мог указывать конкретную версию.
+  ВЫ УВИДИТЕ: "service/reviews-v1 created" и ещё несколько сервисов.
+
+    cat > ~/reviews-httproute.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: reviews
+  namespace: bookinfo
+spec:
+  parentRefs:
+  - group: ""
+    kind: Service
+    name: reviews
+    port: 9080
+  rules:
+  - backendRefs:
+    - name: reviews-v1
+      port: 9080
+      weight: 90
+    - name: reviews-v2
+      port: 9080
+      weight: 10
+EOF
+    k1 apply -f ~/reviews-httproute.yaml
+  ЗАЧЕМ: правило attaches к сервису reviews через parentRefs (kind Service) и делит
+  трафик 90/10 между reviews-v1 и reviews-v2. Так выглядит L7 только через waypoint.
+  ВЫ УВИДИТЕ: "httproute.gateway.networking.k8s.io/reviews created".
+
+    k1 get httproute -n bookinfo
+  ВЫ УВИДИТЕ: два маршрута — bookinfo (ingress) и reviews.
+
+ШАГ 9. Проверяем распределение трафика
+
+    k1 run -n bookinfo l7-client --rm -i --restart=Never --image=busybox:1.36 \
+      -- sh -c 'for i in $(seq 1 50); do wget -qO- http://reviews:9080/reviews/0; echo; done' \
+      > /tmp/reviews.json
+  ЗАЧЕМ: клиент в том же namespace идёт к сервису reviews, ztunnel направляет его в
+  waypoint, а waypoint применяет веса HTTPRoute. В ответах v2 есть поле rating, у v1 его нет.
+  ВЫ УВИДИТЕ: файл /tmp/reviews.json, в нём 50 JSON-ответов.
+
+    wc -l /tmp/reviews.json
+    grep -c rating /tmp/reviews.json
+  ЗАЧЕМ: если маршрут работает, примерно 10% ответов (5 из 50) приходят от reviews-v2
+  и содержат rating.
+  ВЫ УВИДИТЕ: 50 строк и число от 2 до 12. Ноль означает, что трафик не пошёл через
+  waypoint — см. разбор ошибок; 50 означает, что правило не применилось.
+  ПРОВЕРИТЬ НА СТЕНДЕ: поле rating в JSON ответа reviews-v2. Документация 1.25 проверяет
+  распределение визуально (чёрные звёзды у v2); формат JSON может отличаться по версии
+  приложения. Если rating нет ни в одном ответе — проверьте распределение по логам
+  подов reviews-v1 и reviews-v2.
+
+ШАГ 10. Смотрим, что осталось от sidecar-модели
+
+    k1 get pods -n bookinfo
+    k1 get pods -n istio-system -l app=ztunnel
+  ЗАЧЕМ: сравнить две модели: в подах нет istio-proxy, а L4-прокси теперь на узлах.
+  ВЫ УВИДИТЕ: поды bookinfo 1/1 (только приложение) и ztunnel по одному на узел.
+
+    istioctl proxy-status | head -5
+  ВЫ УВИДИТЕ: ztunnel'ы, waypoint и gateway (Gateway API). Привычных строк с
+  именами подов bookinfo нет: sidecar'ов у них не существует.
+
+ОГРАНИЧЕНИЯ AMBIENT
+  - L4 (mTLS, простые политики, телеметрия соединений) даёт ztunnel. Всё L7 — веса,
+    заголовки, ретраи, таймауты, L7-политики — только через waypoint.
+  - VirtualService в ambient официально Alpha, смешивать его с Gateway API нельзя:
+    поведение не определено. Для L7 — HTTPRoute, для ingress — Gateway API Gateway.
+  - Метрик уровня отдельного пода, как у sidecar, нет: ztunnel даёт L4-телеметрию,
+    HTTP-метрики появляются только там, где есть waypoint.
+  - Приложение не знает, что оно в mesh: нет перехвата iptables в поде и нет отдельного
+    контейнера. Зато ztunnel — общий компонент узла: его перезапуск влияет на все поды.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки сразу:
+    k1 get pods -n bookinfo -l app=productpage \
+      -o jsonpath='{.items[0].spec.containers[*].name}'
+    grep -c rating /tmp/reviews.json
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$GW_IP/productpage"
+  ВЫ УВИДИТЕ: только имя приложения (istio-proxy нет), около 5 ответов с rating из 50,
+  HTTP 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: istioctl install --set profile=ambient падает на CRD, установленных Helm
+ПРИЧИНА: после Helm-установки у CRD остались метки владельца, и серверный apply нового
+профиля конфликтует.
+ЧТО ДЕЛАТЬ:
+  1. Найти в тексте ошибки имя CRD.
+  2. Удалить старые CRD Istio: k1 get crd -oname | grep istio.io | xargs k1 delete crd.
+     Объекты Istio при этом удалятся — их пересоздаст ambient.
+  3. Повторить istioctl install --set profile=ambient -y.
+
+ПРОБЛЕМА: ztunnel в статусе Pending или CrashLoopBackOff
+ПРИЧИНА: CNI-плагин не запустился на узле, конфликт с другой CNI, не хватает прав.
+ЧТО ДЕЛАТЬ:
+  1. k1 get pods -n istio-system -l k8s-app=istio-cni-node и k1 logs по проблемному поду.
+  2. k1 describe pod -n istio-system -l app=ztunnel — посмотреть события.
+  3. Проверить метку namespace: k1 get namespace bookinfo -L istio.io/dataplane-mode.
+
+ПРОБЛЕМА: поды bookinfo остались 2/2, istio-proxy не исчез
+ПРИЧИНА: ревизионная метка снялась не полностью, или поды не пересоздавались после
+смены метки.
+ЧТО ДЕЛАТЬ:
+  1. k1 get namespace bookinfo --show-labels — метки istio.io/rev быть не должно.
+  2. k1 rollout restart deployment -n bookinfo и дождаться Ready.
+  3. Проверить, что в поде нет аннотации sidecar.istio.io/inject=true.
+
+ПРОБЛЕМА: GW_IP пустой, приложение снаружи недоступно
+ПРИЧИНА: MetalLB не выдал адрес Gateway API шлюзу, или шлюз ещё не запрограммирован.
+ЧТО ДЕЛАТЬ:
+  1. k1 get gateway.gateway.networking.k8s.io -n bookinfo — колонка PROGRAMMED True.
+  2. k1 get svc -n bookinfo — найти сервис типа LoadBalancer и его EXTERNAL-IP.
+  3. Если EXTERNAL-IP pending — проверить MetalLB: k1 get pods -n metallb-system.
+
+ПРОБЛЕМА: grep -c rating даёт 0, хотя HTTPRoute применён
+ПРИЧИНА: трафик не попадает в waypoint: namespace не enrolled или waypoint не запущен.
+ЧТО ДЕЛАТЬ:
+  1. k1 get namespace bookinfo -L istio.io/use-waypoint — значение должно быть waypoint.
+  2. k1 get pods -n bookinfo -l gateway.networking.k8s.io/gateway-name=waypoint.
+  3. Если метки нет — повторить istioctl waypoint apply -n bookinfo --enroll-namespace.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Добавьте в HTTPRoute правило по заголовку: если клиент присылает end-user=jason,
+  весь его трафик идёт на reviews-v2 (weight 100), остальные — 90/10. Проверьте оба
+  случая из пода l7-client и объясните, почему для правила по заголовку обязателен
+  waypoint, а для весов на L4 — нет.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Почему в ambient поды bookinfo стали 1/1 и куда делась обработка трафика?
+  2. Чем ztunnel отличается от sidecar Envoy и почему L7 вынесен в waypoint?
+  3. Зачем после смены метки namespace поды нужно перезапускать?
+  4. Почему для L7 в ambient используют Gateway API, а не VirtualService?
+  5. Что произойдёт с трафиком namespace, если удалить waypoint, но оставить метку
+     istio.io/use-waypoint?
+
+УБОРКА
+  Удаляем объекты ambient и возвращаем baseline:
+    k1 delete httproute -n bookinfo --all
+    k1 delete gateway.gateway.networking.k8s.io -n bookinfo bookinfo-gateway waypoint
+    k1 delete service -n bookinfo reviews-v1 reviews-v2 reviews-v3 --ignore-not-found
+    k1 label namespace bookinfo istio.io/dataplane-mode- istio.io/use-waypoint-
+    bash ~/istio-course/scripts/reset-istio.sh
+  ЗАЧЕМ: работа меняет control plane, поэтому по стандарту курса стенд возвращается
+  к Helm-установке с ревизией 1-25. Классический Gateway и VirtualService bookinfo
+  из работы 1.1 не трогаем: после возврата baseline они снова работают.
+  ВЫ УВИДИТЕ: в конце скрипта поды istiod и gateway Running, bookinfo 2/2.
+  Если скрипт упал на создании namespace istio-system — namespace ещё удалялся:
+  дождитесь удаления и запустите скрипт повторно.
+
+    istioctl proxy-status | head -3
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: proxy-status с SYNC, поды 2/2, HTTP 200 через $INGRESS_HOST.
+  Gateway API CRDs остаются в кластере: они кластерные и ничего не ломают.
+
+ЧТО ДАЛЬШЕ
+  Мы увидели, что mesh может работать без sidecar'ов, и поняли цену этого: L7 только
+  через waypoint, метрики беднее, зато поды чистые. В работе 8.1 вернёмся к sidecar-
+  baseline и займёмся инцидентами: сертификаты, политики, память Envoy и падение istiod.

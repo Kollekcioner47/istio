@@ -1,0 +1,350 @@
+Лабораторная работа 4.1: mTLS и AuthorizationPolicy
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        4. Безопасность
+РАБОТА:        4.1
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  Istio 1.25.2, bookinfo с sidecar, политик безопасности нет (PERMISSIVE)
+СОСТОЯНИЕ ПОСЛЕ: в mesh включён STRICT mTLS, политик авторизации нет
+СЛЕДУЮЩАЯ:     lab-4.2_spire.txt
+
+ЦЕЛИ РАБОТЫ
+  - Перевести mesh с PERMISSIVE на STRICT и увидеть, что клиент без sidecar теряет доступ.
+  - Написать AuthorizationPolicy с разрешением по ServiceAccount и DENY-политику, проверить 403.
+  - Разобрать инцидент «пустой rules в ALLOW-политике блокирует весь трафик» по политикам,
+    access-логам Envoy и rbac-метрикам.
+
+ЧТО МЫ СДЕЛАЕМ
+  Сначала убедимся, что сейчас любой под кластера может обратиться к reviews по обычному HTTP:
+  mesh не требует mTLS. Затем включим STRICT, повторим запрос из пода без sidecar — он перестанет
+  проходить. После этого ограничим доступ к reviews по identity (ServiceAccount), покажем, что
+  DENY важнее ALLOW, и разберём учебный инцидент: пустая ALLOW-политика отрезала productpage.
+  В конце починим, уберём политики авторизации и оставим mesh в STRICT.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin по ssh, кластер cluster-1, стенд после работ 1.1–3.3.
+  - Istio 1.25.2 и bookinfo с sidecar (2/2 в каждом поде), ingress gateway отвечает.
+  - Два образа из Docker Hub: curlimages/curl:8.10.1 (клиенты для проверок).
+  - Интернет на рабочие узлы кластера нужен один раз — для скачивания образа клиента.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем bookinfo и отсутствие политик:
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: у каждого пода READY 2/2 — приложение и istio-proxy.
+
+    k1 get peerauthentication -n istio-system
+  ВЫ УВИДИТЕ: No resources found in istio-system namespace. Так и должно быть:
+  политик нет, по умолчанию mesh работает в PERMISSIVE.
+
+    k1 get authorizationpolicy -n bookinfo
+  ВЫ УВИДИТЕ: No resources found in bookinfo namespace.
+
+    echo "$INGRESS_HOST"
+  ВЫ УВИДИТЕ: IP из пула MetalLB, например 192.168.56.240. Если пусто — перезапустите env.sh.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  В mesh у каждого пода есть криптографическая identity — не логин, а сертификат X.509.
+  Его выпускает control plane (istiod) в формате SPIFFE. Для productpage это
+  spiffe://cluster.local/ns/bookinfo/sa/bookinfo-productpage, в политиках principal записывают
+  без схемы: cluster.local/ns/bookinfo/sa/bookinfo-productpage.
+
+  mTLS — взаимная аутентификация: обе стороны предъявляют сертификат. PeerAuthentication задаёт
+  режим: PERMISSIVE принимает и mTLS, и обычный текст (нужно для миграции), STRICT — только mTLS.
+  Политика в namespace istio-system действует на весь mesh, в bookinfo — на этот namespace.
+
+  AuthorizationPolicy решает, кому можно что. action: ALLOW — разрешён только явно перечисленному,
+  всё остальное отклоняется, если для workload есть хотя бы одна ALLOW-политика. action: DENY
+  отклоняет по совпадению. Порядок вычисления: CUSTOM, затем DENY, затем ALLOW. Поэтому DENY
+  перекрывает ALLOW. Если у ALLOW-политики не задан rules, совпасть не может ни один запрос:
+  «пустая» ALLOW-политика = запретить всё. Об этом и будет инцидент. Отказ виден в access-логе
+  Envoy на целевом поде и в rbac-метриках на порту 15000 (http.<stat_prefix>.rbac.denied).
+
+ШАГ 1. Снимаем baseline: под без sidecar ходит в reviews
+
+    k1 create namespace legacy
+
+    k1 run plain-client -n legacy --image=curlimages/curl:8.10.1 --restart=Never \
+      -- sleep 3600
+  ЗАЧЕМ: pod в namespace без инъекции — имитация старого клиента вне mesh (ВМ, legacy-приложение).
+  ВЫ УВИДИТЕ: pod/plain-client created.
+
+    k1 wait --for=condition=Ready pod/plain-client -n legacy --timeout=120s
+  ВЫ УВИДИТЕ: pod/plain-client condition met; у пода READY 1/1, в отличие от 2/2 в bookinfo.
+  Sidecar нет — значит, трафик этого пода не шифруется.
+
+    k1 exec -n legacy plain-client -- curl -s -o /dev/null -w "%{http_code}\n" \
+      http://reviews.bookinfo.svc.cluster.local:9080/reviews/1
+  ЗАЧЕМ: зафиксировать, что при PERMISSIVE plaintext-запрос проходит.
+  ВЫ УВИДИТЕ: 200.
+
+ШАГ 2. Применяем PERMISSIVE явно
+
+    k1 apply -f - <<'EOF'
+    apiVersion: security.istio.io/v1
+    kind: PeerAuthentication
+    metadata:
+      name: default
+      namespace: istio-system
+    spec:
+      mtls:
+        mode: PERMISSIVE
+    EOF
+  ЗАЧЕМ: зафиксировать исходный режим объектом, а не «по умолчанию»: дальше меняем только mode.
+  ВЫ УВИДИТЕ: peerauthentication.security.istio.io/default created.
+
+    k1 get peerauthentication -n istio-system
+  ВЫ УВИДИТЕ: NAME default, MODE PERMISSIVE, AGE несколько секунд.
+
+ШАГ 3. Переключаемся на STRICT
+
+    k1 apply -f - <<'EOF'
+    apiVersion: security.istio.io/v1
+    kind: PeerAuthentication
+    metadata:
+      name: default
+      namespace: istio-system
+    spec:
+      mtls:
+        mode: STRICT
+    EOF
+  ЗАЧЕМ: STRICT запрещает всё, что не mTLS. Это целевое состояние всего mesh на весь курс.
+  ВЫ УВИДИТЕ: peerauthentication.security.istio.io/default configured.
+
+    k1 get peerauthentication -n istio-system
+  ВЫ УВИДИТЕ: NAME default, MODE STRICT, AGE обновлён.
+
+    k1 exec -n legacy plain-client -- curl -s -o /dev/null -w "%{http_code}\n" \
+      --max-time 5 http://reviews.bookinfo.svc.cluster.local:9080/reviews/1
+  ЗАЧЕМ: проверить, что plaintext-клиент больше не проходит.
+  ВЫ УВИДИТЕ: 000 и ненулевой код возврата curl (соединение сброшено). Это ожидаемый результат:
+  sidecar на reviews не принимает незашифрованный трафик, соединение отклонил listener.
+
+    source ~/istio-course/scripts/env.sh
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: убедиться, что приложение через ingress gateway продолжает работать: gateway в mesh
+  и ходит к productpage по mTLS.
+  ВЫ УВИДИТЕ: 200.
+
+ШАГ 4. Создаём два клиента внутри mesh
+
+    k1 run client-productpage -n bookinfo --image=curlimages/curl:8.10.1 \
+      --restart=Never --overrides='{"spec":{"serviceAccountName":"bookinfo-productpage"}}' \
+      -- sleep 3600
+  ЗАЧЕМ: клиент с identity productpage — проверим, что политика пускает именно ServiceAccount.
+  ВЫ УВИДИТЕ: pod/client-productpage created.
+
+    k1 run client-default -n bookinfo --image=curlimages/curl:8.10.1 --restart=Never \
+      -- sleep 3600
+  ЗАЧЕМ: клиент с identity bookinfo/default — для отрицательной проверки.
+  ВЫ УВИДИТЕ: pod/client-default created.
+
+    k1 wait --for=condition=Ready pod/client-productpage pod/client-default \
+      -n bookinfo --timeout=180s
+  ВЫ УВИДИТЕ: condition met для обоих подов; в READY у них 2/2, sidecar инжектирован.
+
+ШАГ 5. Разрешаем доступ к reviews по ServiceAccount
+
+    k1 apply -f - <<'EOF'
+    apiVersion: security.istio.io/v1
+    kind: AuthorizationPolicy
+    metadata:
+      name: reviews-allow-productpage
+      namespace: bookinfo
+    spec:
+      selector:
+        matchLabels:
+          app: reviews
+      action: ALLOW
+      rules:
+        - from:
+            - source:
+                principals: ["cluster.local/ns/bookinfo/sa/bookinfo-productpage"]
+    EOF
+  ЗАЧЕМ: selector выбирает workload reviews; правило разрешает запросы только с principal
+  productpage. У остальных этот ServiceAccount не совпадёт.
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io/reviews-allow-productpage created.
+
+    k1 exec -n bookinfo client-productpage -- curl -s -o /dev/null -w "%{http_code}\n" \
+      http://reviews.bookinfo.svc.cluster.local:9080/reviews/1
+  ВЫ УВИДИТЕ: 200 — principal совпал, запрос прошёл.
+
+    k1 exec -n bookinfo client-default -- curl -s -o /dev/null -w "%{http_code}\n" \
+      http://reviews.bookinfo.svc.cluster.local:9080/reviews/1
+  ЗАЧЕМ: проверить, что чужой ServiceAccount получает отказ.
+  ВЫ УВИДИТЕ: 403 — Envoy отклонил запрос до приложения.
+
+ШАГ 6. Добавляем DENY и смотрим приоритет
+
+    k1 apply -f - <<'EOF'
+    apiVersion: security.istio.io/v1
+    kind: AuthorizationPolicy
+    metadata:
+      name: reviews-deny-post
+      namespace: bookinfo
+    spec:
+      selector:
+        matchLabels:
+          app: reviews
+      action: DENY
+      rules:
+        - to:
+            - operation:
+                methods: ["POST"]
+    EOF
+  ЗАЧЕМ: DENY вычисляется раньше ALLOW, поэтому запрет POST перекрывает разрешение.
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io/reviews-deny-post created.
+
+    sleep 25
+    k1 exec -n bookinfo client-productpage -- curl -s -o /dev/null -w "%{http_code}\n" \
+      -X POST http://reviews.bookinfo.svc.cluster.local:9080/reviews/1
+  ЗАЧЕМ: тот же разрешённый principal, но метод POST.
+  ВЫ УВИДИТЕ: 403, хотя ALLOW-политика запрос пропускает. Это работа DENY. Политика
+  доезжает до sidecar за 20–25 с: при меньшей паузе можно увидеть 405.
+
+ШАГ 7. Инцидент: пустая ALLOW-политика отрезает productpage
+
+    k1 apply -f - <<'EOF'
+    apiVersion: security.istio.io/v1
+    kind: AuthorizationPolicy
+    metadata:
+      name: productpage-empty
+      namespace: bookinfo
+    spec:
+      selector:
+        matchLabels:
+          app: productpage
+    EOF
+  ЗАЧЕМ: воспроизвести типовую аварию: коллега создал ALLOW-политику и не добавил rules.
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io/productpage-empty created.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: увидеть симптом.
+  ВЫ УВИДИТЕ: 403. Приложение не менялось и поды Ready — сломан доступ, а не приложение.
+
+ШАГ 8. Диагностика инцидента: политики, лог Envoy, rbac-метрики
+
+    k1 get authorizationpolicy productpage-empty -n bookinfo -o yaml
+  ЗАЧЕМ: увидеть, что в spec нет rules. Для action ALLOW это значит «не разрешено ничего».
+  ВЫ УВИДИТЕ: selector с app: productpage и ни одного правила — причина найдена по конфигурации.
+
+    PRODUCTPAGE_POD=$(k1 get pod -n bookinfo -l app=productpage \
+      -o jsonpath='{.items[0].metadata.name}')
+    k1 logs -n bookinfo "$PRODUCTPAGE_POD" -c istio-proxy --tail=50 |
+      grep '"response_code":403'
+  ЗАЧЕМ: access-лог inbound-запросов на самом productpage показывает код ответа.
+  ВЫ УВИДИТЕ: JSON-строки access-лога с "response_code":403 — отказ Envoy
+  (access-логи включены в JSON ещё в работе 2.1).
+
+    k1 exec -n bookinfo "$PRODUCTPAGE_POD" -c istio-proxy -- \
+      curl -s localhost:15000/stats | grep rbac
+  ЗАЧЕМ: метрики RBAC-фильтра — числовое подтверждение, что запросы режутся политикой.
+  ВЫ УВИДИТЕ: строки http.<stat_prefix>.rbac.allowed и http.<stat_prefix>.rbac.denied, denied > 0.
+  Если rbac-строк нет — запросы до фильтра не дошли, ищите проблему в другом месте.
+
+ШАГ 9. Исправляем политику
+
+    k1 apply -f - <<'EOF'
+    apiVersion: security.istio.io/v1
+    kind: AuthorizationPolicy
+    metadata:
+      name: productpage-empty
+      namespace: bookinfo
+    spec:
+      selector:
+        matchLabels:
+          app: productpage
+      action: ALLOW
+      rules:
+        - from:
+            - source:
+                namespaces: ["istio-system"]
+          to:
+            - operation:
+                methods: ["GET"]
+    EOF
+  ЗАЧЕМ: добавить разрешающее правило для ingress gateway: он живёт в namespace istio-system.
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io/productpage-empty configured.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200 — доступ вернулся, rbac.denied перестал расти. Поды не перезапускали:
+  istiod разослал новую политику.
+
+ШАГ 10. Уборка: снимаем политики авторизации, STRICT оставляем
+
+    k1 delete authorizationpolicy -n bookinfo --all
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io "reviews-allow-productpage" deleted
+  и ещё две строки.
+
+    k1 delete pod client-productpage client-default -n bookinfo --ignore-not-found
+    k1 delete namespace legacy
+  ВЫ УВИДИТЕ: namespace "legacy" deleted; клиентские поды удалены. PeerAuthentication
+  default STRICT остаётся — это новое состояние стенда.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки:
+    k1 get peerauthentication -n istio-system -o jsonpath='{.items[0].spec.mtls.mode}'
+    k1 get authorizationpolicy -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: STRICT, No resources found in bookinfo namespace, 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: после STRICT plaintext-клиент получает 000, а запрос из пода mesh — тоже 000
+ПРИЧИНА: plaintext ожидаемо отклоняется. Если ломается и запрос с sidecar, дело в другом:
+прокси не получил сертификат или не синхронизирован с istiod.
+ЧТО ДЕЛАТЬ:
+  1. Проверить синхронизацию: istioctl proxy-status. В колонке SYNC должно быть SYNC.
+  2. Проверить, что у пода есть sidecar: k1 get pod -n bookinfo --show-labels, READY 2/2.
+  3. Посмотреть сертификат: istioctl proxy-config secret "$PRODUCTPAGE_POD" -n bookinfo.
+
+ПРОБЛЕМА: ALLOW-политика применена, но 403 получает даже разрешённый ServiceAccount
+ПРИЧИНА: principal не совпал: ошибка в trust domain, namespace или имени ServiceAccount,
+либо клиент ходит без mTLS (нет sidecar).
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть реальные ServiceAccount: k1 get sa -n bookinfo.
+  2. Проверить trust domain mesh: k1 get configmap istio -n istio-system -o yaml | grep trustDomain.
+     Principal собирается как <trustDomain>/ns/<namespace>/sa/<serviceAccount>.
+  3. Сверить имя клиента: curl должен идти из пода bookinfo с sidecar, а не из legacy.
+
+ПРОБЛЕМА: политика создана, но поведение не изменилось, 403 не появляется
+ПРИЧИНА: selector не совпал с метками пода, политика лежит в другом namespace, либо трафик
+вообще не проходит через sidecar (под без инъекции).
+ЧТО ДЕЛАТЬ:
+  1. Сверить метки: k1 get pod -n bookinfo --show-labels и selector политики.
+  2. Проверить namespace политики: k1 get authorizationpolicy -A.
+  3. Убедиться, что клиент в mesh: k1 get pod -n bookinfo client-default — READY 2/2.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  В документации AuthorizationPolicy поле source.serviceAccounts названо более простым аналогом
+  principals. Перепишите политику reviews-allow-productpage через serviceAccounts ("bookinfo/
+  bookinfo-productpage"), проверьте оба запроса из шага 5 и объясните разницу в записи.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем PERMISSIVE отличается от STRICT и зачем нужен PERMISSIVE при миграции?
+  2. Как из principal понять namespace и ServiceAccount вызывающей стороны?
+  3. Почему пустая ALLOW-политика блокирует всё, а политика без action — нет?
+  4. Что вычисляется раньше, DENY или ALLOW, и как это использовать в защите?
+  5. Где искать причину 403: какие три источника (конфигурация, лог, метрика) вы проверите?
+  6. Почему клиент без sidecar не может пройти STRICT даже с правильным ServiceAccount?
+
+УБОРКА
+  Политики авторизации и временные клиенты удалены в шаге 10. На стенде остаётся:
+  - PeerAuthentication default STRICT в istio-system (mesh требует mTLS);
+  - bookinfo с sidecar, ingress gateway отвечает, политик авторизации нет;
+  - namespace legacy удалён.
+  Ничего больше не удаляем: STRICT нужен следующей работе, где меняется источник сертификатов.
+  Проверить состояние:
+    k1 get peerauthentication -n istio-system
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+
+ЧТО ДАЛЬШЕ
+  Мы включили mTLS и научились управлять доступом политиками, а также разобрали типовую аварию
+  «политика отрезала трафик». В работе 4.2 уведём выпуск сертификатов из istiod во внешний
+  провайдер SPIRE и посмотрим, как identity приходит из SPIFFE-инфраструктуры.

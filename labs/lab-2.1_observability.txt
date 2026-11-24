@@ -1,0 +1,346 @@
+Лабораторная работа 2.1: Аддоны наблюдаемости, метрики и access-логи
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        2. Observability
+РАБОТА:        2.1
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     easy
+ТИП:           individual
+СОСТОЯНИЕ ДО:  Istio 1.25.2 на cluster-1, control plane управляется Helm-релизом istiod,
+               bookinfo с sidecar, ingress gateway отвечает по $INGRESS_HOST, аддонов нет
+СОСТОЯНИЕ ПОСЛЕ: Prometheus, Grafana, Kiali и Jaeger работают в istio-system, access-логи
+               Envoy включены через meshConfig; это baseline работ 2.2-9.2
+СЛЕДУЮЩАЯ:     lab-2.2_tracing.txt
+
+ЦЕЛИ РАБОТЫ
+  - Поставить четыре аддона наблюдаемости и убедиться, что они собирают данные из mesh.
+  - Включить access-логи Envoy через meshConfig и прочитать их.
+  - Научиться отвечать на вопросы «сколько запросов, сколько ошибок, какая задержка»
+    запросами PromQL, дашбордами Grafana и графом Kiali.
+
+ЧТО МЫ СДЕЛАЕМ
+  Поставим в istio-system Prometheus, Grafana, Kiali и Jaeger из дистрибутива Istio. Затем
+  включим access-логи через meshConfig Helm-релиза istiod, погоняем трафик по bookinfo и
+  посмотрим на него тремя способами: сырыми логами прокси, метриками в Prometheus и
+  дашбордами Grafana и Kiali. Стенд останется с аддонами и включёнными логами — на этом
+  baseline мы будем разбирать инциденты весь курс.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh и загруженное окружение env.sh.
+  - cluster-1 с Istio 1.25.2, bookinfo в namespace bookinfo, MetalLB и рабочий $INGRESS_HOST.
+  - Control plane, установленный Helm-релизом istiod (так заканчивается работа 1.2).
+    Если релиза нет, шаг с helm upgrade не сработает — что делать, см. «ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК».
+  - Интернет на admin для helm repo при первом запуске (chart istiod версии 1.25.2).
+  - Браузер на рабочем месте студента: аддоны открываются по IP admin.
+  - Запас ресурсов на узлах: аддоны небольшие, но Jaeger и Prometheus пишут данные в emptyDir.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Смотрим, что уже установлено:
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: поды istiod (с ревизией имя будет istiod-1-25) и istio-ingressgateway в
+  статусе 1/1 Running, может быть и istio-egressgateway. Аддонов наблюдаемости пока нет.
+
+    helm ls -n istio-system
+  ВЫ УВИДИТЕ: релизы istio-base, istiod и istio-ingress в статусе deployed. Если список пуст,
+  control plane ставился через istioctl — см. вторую ПРОБЛЕМУ ниже.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: шесть подов bookinfo, у каждого READY 2/2.
+
+    echo "$INGRESS_HOST"
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: IP из пула MetalLB и код 200. Если IP пустой — перезапустите env.sh.
+
+  Дистрибутив с демо-аддонами на месте:
+    ls ~/istio-1.25.2/samples/addons/
+  ВЫ УВИДИТЕ: README.md, grafana.yaml, jaeger.yaml, kiali.yaml, loki.yaml, prometheus.yaml.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  У Istio три вида наблюдаемости, и все три рождаются в sidecar-прокси Envoy: метрики,
+  access-логи и трейсы. Ни Prometheus, ни Grafana, ни Kiali не входят в поставку Istio — это
+  отдельные аддоны, которые ставятся в кластер обычными манифестами. Демо-набор лежит в
+  ~/istio-1.25.2/samples/addons и в профиль установки demo не входит.
+
+  Метрики. Инжектор sidecar добавляет поду приложения аннотации prometheus.io/scrape и
+  prometheus.io/port, а прокси отдаёт метрики на :15020/stats/prometheus. При включённом
+  metrics merging (по умолчанию) в этот поток добавляются и метрики самого приложения.
+  Prometheus из аддона скрейпит поды по аннотациям. Сам istiod — отдельный источник: его
+  метрики на :15014/metrics, и его под тоже помечен аннотациями для скрейпа.
+
+  Метрики стандартные, одинаковые для всех прокси: istio_requests_total (счётчик запросов),
+  istio_request_duration_milliseconds (гистограмма длительности), istio_request_bytes и
+  istio_response_bytes. Метки reporter, response_code, destination_service, source_workload и
+  ещё два десятка других — по ним строятся все запросы и все дашборды.
+
+  Логи. Access-лог Envoy — строка на каждый запрос: код ответа, длительность, upstream.
+  Включается полем meshConfig.accessLogFile: /dev/stdout. Это конфигурация control plane,
+  поэтому её меняют через установку, а не патчем конфигмапа: в курсе control plane управляется
+  Helm-релизом istiod, значит и правка идёт через helm upgrade. JSON удобнее для разбора
+  фильтрами, текст — для чтения глазами.
+
+  Grafana и Kiali работают поверх метрик Prometheus: Grafana показывает готовые дашборды Istio,
+  Kiali строит граф сервисов и показывает конфигурацию Istio.
+
+ШАГ 1. Смотрим, что есть и чего нет в istio-system
+
+    k1 get deployment -n istio-system
+  ЗАЧЕМ: зафиксировать исходное состояние до установки аддонов.
+  ВЫ УВИДИТЕ: istiod (или istiod-1-25, если control plane с ревизией) и istio-ingressgateway,
+  возможно ещё istio-egressgateway.
+
+ШАГ 2. Ставим аддоны из дистрибутива
+
+    k1 apply -f ~/istio-1.25.2/samples/addons/prometheus.yaml
+  ЗАЧЕМ: Prometheus — единственный источник метрик, остальные аддоны читают его.
+  ВЫ УВИДИТЕ: serviceaccount/prometheus, configmap/prometheus, service/prometheus,
+  deployment.apps/prometheus — все created.
+
+    k1 apply -f ~/istio-1.25.2/samples/addons/grafana.yaml
+  ЗАЧЕМ: Grafana даёт готовые дашборды Istio — не нужно писать свои панели с нуля.
+  ВЫ УВИДИТЕ: набор created, в конце deployment.apps/grafana created.
+
+    k1 apply -f ~/istio-1.25.2/samples/addons/kiali.yaml
+  ЗАЧЕМ: Kiali — граф сервисов, здоровье и валидация конфигурации Istio в одном UI.
+  ВЫ УВИДИТЕ: configmap/kiali, service/kiali, deployment.apps/kiali и объекты RBAC — created.
+
+    k1 apply -f ~/istio-1.25.2/samples/addons/jaeger.yaml
+  ЗАЧЕМ: Jaeger — трейсы; ставим его сейчас вместе со всеми, а настроим в работе 2.2.
+  ВЫ УВИДИТЕ: deployment.apps/jaeger, service/tracing, service/zipkin,
+  service/jaeger-collector — created.
+
+  В каталоге ~/istio-1.25.2/samples/addons есть ещё loki.yaml. Мы ставим только четыре
+  аддона: Loki в курсе не используется и не нужен для дашбордов.
+
+  Ждём готовности аддонов:
+    k1 wait --for=condition=Available -n istio-system --timeout=300s \
+      deployment/prometheus deployment/grafana deployment/kiali deployment/jaeger
+  ЗАЧЕМ: аддоны тянут образы, первый запуск может занять несколько минут.
+  ВЫ УВИДИТЕ: четыре строки "condition met" — по одной на каждый аддон.
+
+ШАГ 3. Смотрим UI Prometheus и учимся читать метрики mesh
+
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: к istiod и gateway добавились четыре пода аддонов (prometheus, grafana, kiali,
+  jaeger) в статусе Running.
+
+  Открываем UI Prometheus в отдельном терминале:
+    istioctl dashboard prometheus --address 0.0.0.0 --browser=false
+  ЗАЧЕМ: открыть UI и делать запросы PromQL. Флаг --address 0.0.0.0 делает порт доступным не
+  только с admin, --browser=false отключает попытку открыть браузер на сервере.
+  ВЫ УВИДИТЕ: строку http://0.0.0.0:9090 и "skipping opening a browser". Откройте в браузере
+  с рабочего места http://10.0.2.5:9090 и перейдите на вкладку Graph. Команда держит
+  port-forward, пока вы работаете; останавливается по Ctrl+C.
+
+  Сначала нужен трафик: Prometheus скрейпит раз в 15 секунд, без запросов графики пустые.
+  В отдельном терминале на admin запускаем поток запросов:
+    while true; do
+      curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+      sleep 1
+    done
+  ЗАЧЕМ: сделать метрики и логи осмысленными на всё время работы.
+  ВЫ УВИДИТЕ: поток строк 200. Остановить — Ctrl+C.
+
+  Запрос 1 — сколько запросов получает каждый сервис:
+    sum(rate(istio_requests_total{reporter="destination"}[1m])) by (destination_service)
+  ЗАЧЕМ: rate по счётчику за минуту с группировкой по сервису — базовый ответ на вопрос
+  «кто сколько получает».
+  ВЫ УВИДИТЕ: отдельную строку на каждый сервис bookinfo; у productpage около 1 запроса в
+  секунду, у reviews, ratings и details — своё значение.
+
+  Запрос 2 — ошибочные ответы 5xx. Запрос не влезает в строку — вставляйте обе строки,
+  для PromQL перевод строки это обычный пробел:
+    sum(rate(istio_requests_total{reporter="destination",response_code=~"5.."}[5m]))
+      by (destination_service)
+  ЗАЧЕМ: отделить «медленно» от «сломано»; в здоровом mesh ошибок нет.
+  ВЫ УВИДИТЕ: "Empty query result" или строку со значением 0 — это нормальное
+  состояние до инцидентов.
+
+  Запрос 3 — p99 задержки (тоже в две строки):
+    histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket[5m]))
+      by (le, destination_service))
+  ЗАЧЕМ: гистограмма хранит счётчики по корзинам, histogram_quantile превращает их в
+  процентиль. p99 отвечает на вопрос «как плохо самым невезучим пользователям».
+  ВЫ УВИДИТЕ: по строке на сервис, значения в миллисекундах; у productpage обычно десятки.
+
+  Запрос 4 — метрики control plane:
+    pilot_xds
+  ЗАЧЕМ: gauge, показывающий, сколько прокси подключено к istiod.
+  ВЫ УВИДИТЕ: число, близкое к количеству подов с sidecar плюс gateway.
+
+    sum by (type) (rate(pilot_xds_pushes[5m]))
+  ЗАЧЕМ: счётчик отправленных конфигураций по типам lds, rds, cds, eds. Всплеск виден при
+  каждом изменении конфигурации и при проблемах control plane.
+  ВЫ УВИДИТЕ: несколько строк по типам с небольшими значениями, в покое близкими к нулю.
+
+ШАГ 4. Включаем access-логи Envoy через meshConfig
+
+    helm upgrade istiod istio/istiod -n istio-system --version 1.25.2 --reuse-values \
+      --set meshConfig.accessLogFile=/dev/stdout \
+      --set meshConfig.accessLogEncoding=JSON --wait
+  ЗАЧЕМ: accessLogFile включает журнал запросов Envoy, accessLogEncoding=JSON переводит его в
+  машиночитаемый вид. --reuse-values сохраняет настройки релиза из работ 1.1-1.2, --version
+  фиксирует chart 1.25.2, иначе helm подтянет более новый Istio и сломает версию стенда.
+  ВЫ УВИДИТЕ: Release «istiod» has been upgraded, STATUS: deployed, REVISION увеличился.
+
+  Проверяем, что настройка попала в MeshConfig:
+    k1 get configmap -n istio-system -o yaml | grep -A3 accessLog
+  ЗАЧЕМ: убедиться, что меняли установку, а не конфигмап руками.
+  ВЫ УВИДИТЕ: accessLogFile: /dev/stdout и accessLogEncoding: JSON в секции mesh.
+
+  ПРОВЕРИТЬ НА СТЕНДЕ: что новые access-логи появляются без перезапуска подов приложения —
+  настройка приезжает в прокси по xDS. Если в следующем шаге логов нет, перезапуск описан в
+  третьей ПРОБЛЕМЕ.
+
+ШАГ 5. Читаем access-лог
+
+    k1 logs -n bookinfo -l app=productpage -c istio-proxy --tail=3
+  ЗАЧЕМ: увидеть, что пишет прокси, и научиться читать эти строки.
+  ВЫ УВИДИТЕ: JSON-строки, по одной на запрос. Ключевые поля: "response_code":200, "duration"
+  в миллисекундах, "upstream_cluster":"inbound|9080||" для входящего запроса и
+  "outbound|9080||reviews.bookinfo.svc.cluster.local" для исходящего в reviews.
+
+    k1 logs -n bookinfo -l app=productpage -c istio-proxy --tail=1
+  ЗАЧЕМ: разобрать одну строку целиком: кто клиент, куда ушёл запрос, сколько длился.
+  ВЫ УВИДИТЕ: одну JSON-строку. Проверьте по ней: "method":"GET", путь "/productpage",
+  "response_code":200, "upstream_host" — адрес пода, которому прокси отправил запрос.
+
+  Важная разница: метрика отвечает «сколько и как долго», лог — «что именно произошло в этом
+  запросе». Для разбора единичного случая лог точнее, для картины в целом — метрика.
+
+ШАГ 6. Grafana: готовые дашборды Istio
+
+  В отдельном терминале открываем Grafana:
+    istioctl dashboard grafana --address 0.0.0.0 --browser=false
+  ЗАЧЕМ: посмотреть те же метрики глазами, без ручных PromQL.
+  ВЫ УВИДИТЕ: строку http://0.0.0.0:3000. Откройте http://10.0.2.5:3000.
+  ПРОВЕРИТЬ НА СТЕНДЕ: демо-аддон Grafana использует стандартные admin / admin (анонимный
+  вход не включён).
+  После первого входа Grafana предложит сменить пароль — для учебного стенда можно пропустить.
+
+  Откройте дашборды и найдите на них bookinfo:
+    Istio Mesh Dashboard, Istio Service Dashboard, Istio Workload Dashboard,
+    Istio Control Plane Dashboard.
+  ВЫ УВИДИТЕ: в Mesh Dashboard таблицу сервисов с RPS и задержками p50/p90/p99. В Service
+  Dashboard выберите productpage.bookinfo и сравните график задержки с p99 из Prometheus.
+
+  В Control Plane Dashboard смотрите метрики istiod: число подключённых прокси, время
+  сходимости конфигурации, ошибки push. Это первые графики, на которые смотрят, когда
+  «весь mesh ведёт себя странно».
+
+ШАГ 7. Kiali: граф сервисов
+
+  В отдельном терминале открываем Kiali:
+    istioctl dashboard kiali --address 0.0.0.0 --browser=false
+  ЗАЧЕМ: Kiali строит топологию из тех же метрик и сразу показывает, где рвётся.
+  ВЫ УВИДИТЕ: строку http://0.0.0.0:20001/kiali. Откройте http://10.0.2.5:20001/kiali —
+  в демо-аддоне Kiali вход анонимный, логин не нужен.
+
+  В Kiali выберите namespace bookinfo и откройте Graph:
+  ВЫ УВИДИТЕ: узлы productpage, details, ratings и reviews трёх версий, рёбра с RPS и
+  процентами ошибок. В меню Istio Config — список объектов Istio в namespace.
+  Наведите курсор на узел reviews: справа появится панель с метриками этого узла.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки подряд:
+    k1 get pods -n istio-system | grep -E "prometheus|grafana|kiali|jaeger" | wc -l
+  ВЫ УВИДИТЕ: 4 — по одному поду каждого аддона.
+
+    k1 get configmap -n istio-system -o yaml | grep -A3 accessLog
+  ВЫ УВИДИТЕ: accessLogFile: /dev/stdout и accessLogEncoding: JSON.
+
+    k1 logs -n bookinfo -l app=productpage -c istio-proxy --tail=1 | grep -c response_code
+  ВЫ УВИДИТЕ: 1 — в последней записи есть поле кода ответа.
+
+  Плюс руками: в Prometheus запрос из шага 3 отдаёт строки по сервисам bookinfo, в Grafana
+  открывается Mesh Dashboard, в Kiali виден граф namespace bookinfo.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: helm upgrade отвечает: Error: UPGRADE FAILED: «istiod» has no deployed releases.
+ПРИЧИНА: control plane ставился не Helm-ом: после работы 1.1 остался istioctl install, релиза
+istiod в кластере нет.
+ЧТО ДЕЛАТЬ:
+  1. Проверить релизы: helm ls -n istio-system.
+  2. Вернуться к работе 1.2 и перевести control plane на Helm. Быстрый путь — привести стенд
+     к baseline скриптом курса: bash ~/istio-course/scripts/reset-istio.sh (он ставит istiod
+     через Helm с ревизией 1-25 и уже включает accessLogFile).
+  3. Временный документированный вариант без Helm: istioctl install --set profile=demo
+     --set meshConfig.accessLogFile=/dev/stdout -y. После него control plane снова управляется
+     istioctl, и в работе 2.2 extensionProviders придётся задавать через IstioOperator.
+
+ПРОБЛЕМА: Error: repo istio not found или failed to download «istio/istiod».
+ПРИЧИНА: не добавлен репозиторий Helm с чартами Istio либо нет доступа в интернет.
+ЧТО ДЕЛАТЬ:
+  1. Добавить репозиторий: helm repo add istio https://istio-release.storage.googleapis.com/charts
+  2. Обновить индекс: helm repo update
+  3. Проверить, что нужная версия видна: helm search repo istio/istiod --version 1.25.2
+
+ПРОБЛЕМА: в access-логах пусто, k1 logs с контейнером istio-proxy ничего не печатает.
+ПРИЧИНА: настройка в MeshConfig применилась, но прокси её ещё не получили; либо смотрят не тот
+контейнер (логи Envoy есть только у istio-proxy, у приложения их нет).
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что указан контейнер: k1 logs -n bookinfo -l app=productpage -c istio-proxy.
+  2. Проверить MeshConfig: k1 get configmap -n istio-system -o yaml | grep -A3 accessLog.
+  3. Перезапустить поды приложения и дождаться готовности:
+     k1 rollout restart deployment -n bookinfo
+     k1 rollout status deployment -n bookinfo --timeout=180s
+
+ПРОБЛЕМА: Grafana или Kiali не открываются с рабочего места, браузер показывает
+ERR_CONNECTION_REFUSED.
+ПРИЧИНА: istioctl dashboard по умолчанию слушает только localhost на admin, либо порт закрыт.
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что команда запущена с --address 0.0.0.0 и не завершилась.
+  2. Прокинуть порт через ssh с рабочего места:
+     ssh -L 3000:localhost:3000 engineer@10.0.2.5
+     и открыть http://localhost:3000.
+  3. Проверить, что сам под аддона готов: k1 get pods -n istio-system.
+
+ПРОБЛЕМА: запрос istio_requests_total в Prometheus отдаёт "Empty query result".
+ПРИЧИНА: нет трафика в момент запроса, ещё не прошёл интервал скрейпа (15 секунд) или в
+запросе неверные метки.
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что генератор трафика работает:
+     curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  2. Упростить запрос до istio_requests_total и посмотреть вкладку Status -> Targets.
+  3. Убедиться, что метка reporter задана как destination или source, а не наоборот.
+
+ПРОБЛЕМА: под Kiali в CrashLoopBackOff или OOMKilled.
+ПРИЧИНА: демо-аддон просит limit 1Gi памяти, на маленькой ВМ ему может не хватить.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть причину: k1 describe pod -n istio-system -l app=kiali | tail -20.
+  2. Проверить свободную память узлов: k1 top nodes (нужен metrics-server из setup-guide).
+  3. Продолжить работу с Prometheus и Grafana: для этой работы Kiali не обязателен, вернуться
+     к нему можно после освобождения памяти.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Разберите одну JSON-строку access-лога до конца: выпишите клиента (downstream_remote_address),
+  upstream и длительность. Затем постройте в Prometheus p90 по всему mesh:
+    histogram_quantile(0.9, sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le))
+  Сравните с p99 из шага 3, найдите в Grafana Service Dashboard панель задержки для reviews и
+  объясните, почему p90 и p99 расходятся. Ответьте, какому процентилю соответствует SLA
+  «99% запросов быстрее 300 мс».
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Почему Prometheus, Grafana, Kiali и Jaeger не входят в профиль установки Istio?
+  2. Как Prometheus узнаёт, какие поды скрейпить, и что такое metrics merging?
+  3. Чем access-лог отличается от метрики и в каком разборе без него не обойтись?
+  4. По каким метрикам видно, что проблема в control plane, а не в приложении?
+  5. Почему access-логи включают через установку control plane, а не патчем конфигмапа?
+  6. Что покажет Kiali, чего не покажет Prometheus?
+
+УБОРКА
+  Ничего не удаляем: аддоны, access-логи и bookinfo — baseline работ 2.2-9.2.
+  Остановите Ctrl+C port-forward'ы istioctl dashboard и генератор трафика, чтобы не держать
+  порты и лишнюю нагрузку. Проверяем, что стенд здоров:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: istiod, gateway и четыре аддона Running, шесть подов bookinfo 2/2.
+
+ЧТО ДАЛЬШЕ
+  Мы научились видеть, что происходит с запросами: сколько их, сколько ошибок и сколько
+  времени они занимают. В работе 2.2 добавим третий сигнал — трейсы: включим трейсинг через
+  extensionProvider и Telemetry API и разберём по спанам два инцидента, 503 и задержку.

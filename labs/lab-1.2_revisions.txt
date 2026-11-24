@@ -1,0 +1,279 @@
+Лабораторная работа 1.2: Ревизии, обновление и откат control plane
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        1. Инсталляция и архитектура
+РАБОТА:        1.2
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  Istio установлен профилем demo (работа 1.1), bookinfo с sidecar, ingress отвечает
+СОСТОЯНИЕ ПОСЛЕ: Istio установлен через Helm с ревизией 1-25, bookinfo в mesh, вторая ревизия удалена
+СЛЕДУЮЩАЯ:     lab-2.1_observability.txt
+
+ЦЕЛИ РАБОТЫ
+  - Перевести установку Istio с istioctl на Helm и объяснить, зачем это делают в эксплуатации.
+  - Поставить рядом вторую ревизию control plane и переключить namespace без остановки сервиса.
+  - Сымитировать сбой новой ревизии и откатиться на старую, не потеряв трафик.
+
+ЧТО МЫ СДЕЛАЕМ
+  Переставим Istio через Helm с явной ревизией, развернём bookinfo заново под этой ревизией,
+  поставим рядом вторую ревизию control plane, переключим приложение на неё, сымитируем отказ
+  и вернёмся на старую ревизию. Это основной приём обновления mesh'а без простоя: сначала
+  поднимается новая ревизия, потом на неё переводятся namespace'ы по одному.
+
+ЧТО ПОНАДОБИТСЯ
+  - Стенд после работы 1.1: Istio demo, bookinfo, рабочий ingress gateway.
+  - Helm 3.17+ на admin, доступ в интернет для helm-репозитория Istio (или заранее добавленный repo).
+  - Дистрибутив ~/istio-1.25.2 для istioctl и samples.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем, что предыдущая работа оставила стенд в порядке:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: istiod 1/1, istio-ingressgateway 1/1, istio-egressgateway 1/1 (профиль demo);
+  поды bookinfo 2/2.
+
+    istioctl version
+  ВЫ УВИДИТЕ: client version 1.25.2 и control plane version 1.25.2 — установка через istioctl.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Ревизия — это отдельный экземпляр istiod со своим тегом, например 1-25. Рядом может работать
+  вторая ревизия 1-26. Namespace помечается меткой istio.io/rev=<тег>, и sidecar'ы в нём
+  подключаются именно к этой ревизии.
+
+  Обновление без простоя выглядит так: ставим новую ревизию рядом → переводим на неё один
+  тестовый namespace → смотрим метрики и логи → переводим остальные → удаляем старую.
+  Откат — это обратная метка и перезапуск подов, старая ревизия всё это время жива.
+
+  Helm удобнее istioctl в эксплуатации: релиз можно обновлять параметрами, откатывать
+  helm rollback, а состояние хранится в кластере как Secret/ConfigMap релиза.
+
+ШАГ 1. Убеждаемся, что Helm видит репозиторий Istio
+
+    helm repo add istio https://istio-release.storage.googleapis.com/charts
+    helm repo update
+  ЗАЧЕМ: Helm-чарты Istio лежат в отдельном репозитории; без него установка не начнётся.
+  ВЫ УВИДИТЕ: "istio" already exists with the same configuration (если repo уже был) и
+  "Update Complete. Happy Helming!".
+
+ШАГ 2. Удаляем демонстрационное приложение
+
+    k1 delete namespace bookinfo
+  ЗАЧЕМ: при удалении Istio с флагом --purge удалятся CRD, и объекты bookinfo (Gateway,
+  VirtualService) станут «сиротами». Чище удалить namespace заранее.
+  ВЫ УВИДИТЕ: namespace "bookinfo" deleted.
+
+ШАГ 3. Удаляем установку istioctl
+
+    istioctl uninstall --purge -y
+  ЗАЧЕМ: --purge удаляет не только компоненты, но и cluster-scoped ресурсы прежней установки:
+  CRD, webhook'и. Иначе Helm-установка конфликтует со старой.
+  ВЫ УВИДИТЕ: сообщения об удалении ресурсов, в конце "Uninstall complete".
+
+    k1 get namespace istio-system --ignore-not-found
+  ВЫ УВИДИТЕ: namespace istio-system ещё существует: istioctl uninstall --purge
+  удаляет компоненты, но не сам namespace. Удалите его перед шагом 4:
+    k1 delete namespace istio-system --ignore-not-found --wait
+
+ШАГ 4. Ставим базовый чарт с CRD
+
+    k1 create namespace istio-system
+    helm install istio-base istio/base -n istio-system --version 1.25.2 --wait
+  ЗАЧЕМ: base ставит CRD и cluster-scoped ресурсы. Один раз на кластер, до istiod.
+  ВЫ УВИДИТЕ: STATUS: deployed в выводе helm install.
+
+ШАГ 5. Ставим istiod с ревизией 1-25
+
+    helm install istiod istio/istiod -n istio-system --version 1.25.2 \
+      --set revision=1-25 --set meshConfig.accessLogFile=/dev/stdout \
+      --set meshConfig.accessLogEncoding=JSON --wait
+  ЗАЧЕМ: ревизия 1-25 фиксируется в теге и в метке подов; accessLogFile сразу включает
+  access-логи Envoy — они понадобятся в следующем модуле.
+  ВЫ УВИДИТЕ: STATUS: deployed, затем под istiod-1-25 в статусе Running.
+
+    k1 get pods -n istio-system -l app=istiod --show-labels
+  ВЫ УВИДИТЕ: в LABELS есть istio.io/rev=1-25.
+
+ШАГ 6. Ставим Ingress Gateway для этой же ревизии
+
+    helm install istio-ingress istio/gateway -n istio-system --version 1.25.2 \
+      --skip-schema-validation \
+      --set name=istio-ingressgateway --set revision=1-25 --wait
+
+    # Чарт gateway 1.25.2 отдаёт порт 80 на targetPort 80, а bookinfo Gateway
+    # слушает 8080. Без этой правки curl к productpage вернёт 000.
+    k1 patch svc istio-ingressgateway -n istio-system --type=json \
+      -p '[{"op":"replace","path":"/spec/ports/1/targetPort","value":8080}]'
+  ЗАЧЕМ: gateway должен быть привязан к той же ревизии, что и istiod. name задаёт имя
+  сервиса istio-ingressgateway и метку istio=ingressgateway — на неё ссылаются Gateway
+  и EnvoyFilter во всех следующих работах.
+  ВЫ УВИДИТЕ: под istio-ingressgateway в статусе Running.
+
+    source ~/istio-course/scripts/env.sh
+    echo "$INGRESS_HOST"
+  ЗАЧЕМ: env.sh пересчитывает внешний адрес нового gateway.
+  ВЫ УВИДИТЕ: IP из пула MetalLB.
+
+ШАГ 7. Разворачиваем bookinfo под ревизией 1-25
+
+    k1 create namespace bookinfo
+    k1 label namespace bookinfo istio.io/rev=1-25
+
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/platform/kube/bookinfo.yaml -n bookinfo
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: метка istio.io/rev включает инъекцию от конкретной ревизии; старую метку
+  istio-injection мы здесь не используем.
+  ВЫ УВИДИТЕ: поды bookinfo в статусе 2/2 Running.
+
+ШАГ 8. Публикуем приложение и проверяем трафик
+
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/networking/bookinfo-gateway.yaml -n bookinfo
+    sleep 10
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: убедиться, что Helm-установка обслуживает трафик так же, как прежняя. Gateway
+  должен получить адрес и прогреться; первый запрос сразу после apply может вернуть 000.
+  ВЫ УВИДИТЕ: 200. Если первый запрос дал 000 — подождите 10–15 с и повторите.
+
+    istioctl proxy-status
+  ВЫ УВИДИТЕ: все поды bookinfo в статусе SYNC, в колонке ISTIOD — версия с тегом 1-25.
+
+ШАГ 9. Ставим вторую ревизию 1-26
+
+    helm install istiod-1-26 istio/istiod -n istio-system --version 1.25.2 \
+      --set revision=1-26 --set meshConfig.accessLogFile=/dev/stdout \
+      --set meshConfig.accessLogEncoding=JSON --wait
+  ЗАЧЕМ: новая ревизия поднимается рядом со старой и пока не обслуживает ни один namespace.
+  ВЫ УВИДИТЕ: два пода istiod: istiod-1-25 и istiod-1-26.
+
+    k1 get pods -n istio-system -l app=istiod
+  ВЫ УВИДИТЕ: две строки, обе 1/1 Running.
+
+ШАГ 10. Готовим тестовый namespace на новой ревизии
+
+    k1 create namespace test-revision
+    k1 label namespace test-revision istio.io/rev=1-26
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/platform/kube/bookinfo.yaml -n test-revision
+    k1 wait --for=condition=Ready pods --all -n test-revision --timeout=180s
+  ЗАЧЕМ: канареечный шаг — сначала на новую ревизию переводится один namespace.
+  ВЫ УВИДИТЕ: поды test-revision 2/2 Running.
+
+    istioctl proxy-status | grep test-revision
+  ВЫ УВИДИТЕ: поды test-revision подключены к istiod с тегом 1-26.
+
+ШАГ 11. Переключаем основное приложение на ревизию 1-26
+
+    k1 label namespace bookinfo istio.io/rev=1-26 --overwrite
+    k1 rollout restart deployment -n bookinfo
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: метка меняется мгновенно, но sidecar пересоздаётся только при перезапуске подов.
+  ВЫ УВИДИТЕ: поды bookinfo пересозданы, 2/2 Running.
+
+    istioctl proxy-status | grep bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: поды bookinfo на ревизии 1-26, HTTP 200 — переключение прошло без простоя.
+
+ШАГ 12. Имитируем сбой новой ревизии
+
+    k1 scale deployment -n istio-system istiod-1-26 --replicas=0
+  ЗАЧЕМ: новая ревизия «сломалась» — так выглядит неудачное обновление control plane.
+  ВЫ УВИДИТЕ: под istiod-1-26 удаляется.
+
+    k1 get pods -n istio-system -l app=istiod
+  ВЫ УВИДИТЕ: остался только istiod-1-25.
+
+    istioctl proxy-status
+  ВЫ УВИДИТЕ: часть подов (те, что на 1-26) не SYNC или команда не может получить их статус.
+  Это ожидаемо: их control plane недоступен.
+
+ШАГ 13. Откатываемся на ревизию 1-25
+
+    k1 label namespace bookinfo istio.io/rev=1-25 --overwrite
+    k1 rollout restart deployment -n bookinfo
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: откат — это возврат метки и перезапуск подов; старая ревизия всё это время работала.
+  ВЫ УВИДИТЕ: поды bookinfo снова 2/2 Running.
+
+    istioctl proxy-status
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: все поды SYNC, HTTP 200.
+
+ШАГ 14. Удаляем нерабочую ревизию
+
+    helm uninstall istiod-1-26 -n istio-system --wait
+    k1 delete namespace test-revision --ignore-not-found
+  ЗАЧЕМ: пока проблема не разобрана, ревизию оставляют выключенной; мы её уже разобрали —
+  удаляем, чтобы не занимала ресурсы.
+  ВЫ УВИДИТЕ: релиз istiod-1-26 удалён, namespace test-revision удалён.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: один istiod (1-25), один ingress gateway, поды bookinfo 2/2, HTTP 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: helm install падает с ошибкой про существующие CRD
+ПРИЧИНА: на кластере остались CRD от прежней установки istioctl.
+ЧТО ДЕЛАТЬ:
+  1. Проверить: k1 get crd | grep istio.
+  2. Удалить остатки: k1 get crd -o name | grep istio | xargs -r k1 delete.
+  3. Переустановить: helm install istio-base istio/base -n istio-system --version 1.25.2 --wait.
+
+ПРОБЛЕМА: поды bookinfo остались 1/1, sidecar не появился
+ПРИЧИНА: неверная метка на namespace (istio-injection вместо istio.io/rev) либо метка ревизии
+не совпадает с именем ревизии.
+ЧТО ДЕЛАТЬ:
+  1. Проверить метки: k1 get namespace bookinfo --show-labels.
+  2. Убедиться, что ревизия существует: helm list -n istio-system.
+  3. Пересоздать поды: k1 rollout restart deployment -n bookinfo.
+
+ПРОБЛЕМА: после scale istiod-1-26 в 0 нельзя создать новый под в bookinfo
+ПРИЧИНА: webhook инъекции смотрит на ревизию, а её control plane недоступен; при
+failurePolicy=Fail создание пода блокируется.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть webhook: k1 get mutatingwebhookconfiguration | grep istio.
+  2. Вернуть метку на рабочую ревизию: k1 label namespace bookinfo istio.io/rev=1-25 --overwrite.
+  3. Удалить зависший под и пересоздать deployment.
+
+ПРОБЛЕМА: istioctl proxy-status показывает NOT SENT или STALE
+ПРИЧИНА: sidecar не может получить конфигурацию от своего istiod.
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что под istiod этой ревизии Running.
+  2. Посмотреть логи: k1 logs -n istio-system -l app=istiod --tail=50.
+  3. Проверить, что namespace помечен именно на эту ревизию.
+
+ПРОБЛЕМА: после переустановки curl к productpage возвращает 503
+ПРИЧИНА: gateway установлен, но VirtualService/Gateway не пересозданы после удаления namespace.
+ЧТО ДЕЛАТЬ:
+  1. k1 get gateway,virtualservice -n bookinfo.
+  2. При необходимости применить заново bookinfo-gateway.yaml.
+  3. istioctl analyze -n bookinfo.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Разберитесь с revision tags — это способ не привязывать namespace к номеру ревизии напрямую.
+  Посмотрите `istioctl tag list`, создайте тег `prod` на ревизию 1-25 и переключите bookinfo
+  на `istio.io/rev=prod`. Сравните с прямым указанием 1-25: что удобнее при следующем обновлении?
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Зачем нужны ревизии control plane, если можно просто обновить istiod?
+  2. Что произойдёт с подами при смене метки istio.io/rev на namespace?
+  3. Почему откат на старую ревизию не требует пересоздавать всё приложение?
+  4. Чем чревато удаление старой ревизии до проверки новой?
+  5. Что хранит Helm в кластере и как это помогает при откате?
+
+УБОРКА
+  Оставляем baseline: Istio через Helm, ревизия 1-25, ingress gateway, bookinfo с sidecar.
+  Вторая ревизия и test-revision удалены в шагах 14. Проверяем:
+    helm list -n istio-system
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+
+ЧТО ДАЛЬШЕ
+  Теперь mesh ставится и обновляется предсказуемо. В работе 2.1 добавим наблюдаемость:
+  аддоны, метрики, access-логи и дашборды — без них дальнейшие инциденты нечем разбирать.

@@ -1,0 +1,301 @@
+Лабораторная работа 9.2: Performance — HPA, sizing Envoy, бенчмарк и область xDS
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        9. GitOps и Performance Tuning
+РАБОТА:        9.2
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     hard
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline после 1.2, аддоны после 2.1, metrics-server в кластере
+СОСТОЯНИЕ ПОСЛЕ: HPA и тестовые namespace'ы удалены, baseline восстановлен, замеры сохранены
+СЛЕДУЮЩАЯ:     final_case.txt
+
+ЦЕЛИ РАБОТЫ
+  - Настроить HPA и resource sizing для istiod, проверить их работу по метрикам.
+  - Задать лимиты Envoy-sidecar и увидеть их в поде.
+  - Сравнить latency «без mesh» и «со sidecar» честным инструментом (fortio), а не `time kubectl run`.
+  - Показать, как ограничение области выдачи xDS через ресурс Sidecar уменьшает конфигурацию прокси.
+
+ЧТО МЫ СДЕЛАЕМ
+  Включим HPA для istiod и посмотрим, как он реагирует на нагрузку, зададим лимиты sidecar,
+  снимем статистику Envoy через admin endpoint, прогоним нагрузочный тест fortio в двух
+  namespace'ах (без mesh и со sidecar) и сравним цифры. Затем ограничим область выдачи xDS
+  ресурсом Sidecar и увидим, как уменьшается конфигурация прокси.
+
+ЧТО ПОНАДОБИТСЯ
+  - metrics-server (ставится в setup-guide; без него не работают `kubectl top` и HPA).
+  - Образ fortio/fortio (скачивается из интернета один раз).
+  - Свободные ресурсы на воркерах: тест создаёт несколько подов.
+
+ПРОВЕРКА СТЕНДА
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+    k1 top nodes
+  ВЫ УВИДИТЕ: таблицу CPU/CPU% и MEMORY для узлов. Если команда падает с "Metrics API not available" —
+  см. раздел "ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК".
+
+    k1 get hpa -n istio-system
+  ВЫ УВИДИТЕ: пустой вывод — HPA ещё не создан.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: поды bookinfo 2/2 Running.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Производительность mesh'а складывается из трёх вещей: control plane (istiod) должен успевать
+  раздавать конфигурацию, data plane (Envoy) не должен упираться в CPU/память, а конфигурация
+  не должна быть избыточной.
+
+  HPA масштабирует istiod по CPU. Envoy ограничивают аннотациями пода: proxyCPU, proxyMemory,
+  proxyConcurrency. Область выдачи xDS можно сократить ресурсом Sidecar: прокси получит только
+  те сервисы, которые ему действительно нужны. Это механизм, который часто называют
+  «ленивой» выдачей конфигурации; отдельный проект lazyxds делает то же на уровне внешнего
+  контроллера.
+
+  Замерять «на глаз» через `time kubectl run` нельзя: измеряется запуск пода, а не сетевая
+  задержка. Честный способ — генератор нагрузки внутри кластера (fortio) и его же отчёт:
+  RPS, p50, p99.
+
+ШАГ 1. Смотрим текущие значения чарта istiod
+
+    helm show values istio/istiod --version 1.25.2 | grep -A 12 "^  autoscale"
+  ЗАЧЕМ: убедиться в именах параметров именно вашей версии чарта, а не верить конспекту.
+  ВЫ УВИДИТЕ: autoscaleEnabled, autoscaleMin, autoscaleMax, cpu.targetAverageUtilization.
+
+ШАГ 2. Включаем HPA для istiod
+
+    helm upgrade istiod istio/istiod -n istio-system --version 1.25.2 --reuse-values \
+      --set pilot.autoscaleEnabled=true \
+      --set pilot.autoscaleMin=2 \
+      --set pilot.autoscaleMax=3 \
+      --set pilot.cpu.targetAverageUtilization=80 --wait
+  ЗАЧЕМ: две реплики control plane — минимум для эксплуатации; HPA добавит третью при нагрузке.
+  ВЫ УВИДИТЕ: STATUS: deployed.
+
+    k1 get hpa -n istio-system
+    k1 get pods -n istio-system -l app=istiod
+  ВЫ УВИДИТЕ: HPA istiod с TARGETS вида 5%/80%, два пода istiod.
+
+ШАГ 3. Создаём нагрузку на control plane
+
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      k1 create namespace "load-$i"
+      k1 label namespace "load-$i" istio.io/rev=1-25
+      k1 create deployment "app-$i" -n "load-$i" --image=nginx
+      k1 expose deployment "app-$i" -n "load-$i" --port=80
+    done
+  ЗАЧЕМ: каждый namespace с сервисом добавляет работу istiod по генерации xDS.
+  ВЫ УВИДИТЕ: 10 namespace'ов, в каждом deployment и service.
+
+    k1 top pods -n istio-system -l app=istiod
+  ВЫ УВИДИТЕ: потребление CPU istiod. На учебном стенде HPA может не успеть дойти до 3 реплик —
+  это нормально: порог 80% на двух воркерах достигается не всегда. Главное — HPA создан и видит
+  метрики.
+
+ШАГ 4. Смотрим, как изменилось число кластеров у sidecar
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$POD" -c istio-proxy -- \
+      curl -s localhost:15000/clusters | grep -c "outbound|"
+  ЗАЧЕМ: зафиксировать исходное число кластеров в конфигурации Envoy.
+  ВЫ УВИДИТЕ: число строк /clusters; на стенде курса это сотни и тысячи строк.
+  Сравнивайте значение до и после ограничения Sidecar, а не абсолютные 15–30.
+
+ШАГ 5. Задаём лимиты Envoy для тестового приложения
+
+    k1 create namespace tuned
+    k1 label namespace tuned istio.io/rev=1-25
+
+    cat <<'EOF' | k1 apply -n tuned -f -
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: httpbin
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: httpbin
+      template:
+        metadata:
+          labels:
+            app: httpbin
+          annotations:
+            sidecar.istio.io/proxyCPU: "100m"
+            sidecar.istio.io/proxyCPULimit: "500m"
+            sidecar.istio.io/proxyMemory: "64Mi"
+            sidecar.istio.io/proxyMemoryLimit: "128Mi"
+            sidecar.istio.io/proxyConcurrency: "2"
+        spec:
+          containers:
+            - name: httpbin
+              image: mccutchen/go-httpbin:v2.14.1
+              ports:
+                - containerPort: 8080
+    EOF
+
+    k1 wait --for=condition=Ready pods --all -n tuned --timeout=120s
+  ЗАЧЕМ: аннотации применяются при инъекции sidecar — под должен быть создан после них.
+  ВЫ УВИДИТЕ: под httpbin 2/2 Running.
+
+    k1 get pods -n tuned -o jsonpath='{.items[0].spec.containers[1].resources}{"\n"}'
+    POD=$(k1 get pod -n tuned -l app=httpbin -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n tuned "$POD" -c istio-proxy -- \
+      curl -s localhost:15000/server_info | grep -o '"concurrency"[^,}]*'
+  ВЫ УВИДИТЕ: requests/limits из аннотаций и поле concurrency (в server_info оно может
+  быть с пробелом: "concurrency": 2).
+
+ШАГ 6. Снимаем статистику Envoy через admin endpoint
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$POD" -c istio-proxy -- \
+      curl -s localhost:15000/stats | grep -E "server.worker|memory" | head -10
+    k1 exec -n bookinfo "$POD" -c istio-proxy -- \
+      curl -s localhost:15000/clusters | wc -l
+  ЗАЧЕМ: admin endpoint 15000 — главный инструмент диагностики data plane.
+  ВЫ УВИДИТЕ: статистику по worker'ам и памяти, число строк clusters.
+
+ШАГ 7. Готовим бенчмарк: namespace без mesh
+
+    k1 create namespace no-mesh
+    k1 create deployment fortio-server -n no-mesh --image=fortio/fortio
+    k1 expose deployment fortio-server -n no-mesh --port=8080
+    k1 wait --for=condition=Ready pods -n no-mesh --timeout=120s
+  ЗАЧЕМ: первый вариант — прямой вызов без прокси.
+  ВЫ УВИДИТЕ: под fortio-server 1/1 Running.
+
+    k1 run fortio-client --rm -i --restart=Never -n no-mesh --image=fortio/fortio -- \
+      load -qps 200 -t 20s -c 8 http://fortio-server:8080/echo
+  ЗАЧЕМ: fortio сам измеряет latency и RPS внутри кластера.
+  ВЫ УВИДИТЕ: отчёт: "All done", RPS, p50/p90/p99 в миллисекундах.
+
+ШАГ 8. Готовим бенчмарк: namespace со sidecar
+
+    k1 create namespace with-sidecar
+    k1 label namespace with-sidecar istio.io/rev=1-25
+    k1 create deployment fortio-server -n with-sidecar --image=fortio/fortio
+    k1 expose deployment fortio-server -n with-sidecar --port=8080
+    k1 wait --for=condition=Ready pods -n with-sidecar --timeout=180s
+
+    k1 get pods -n with-sidecar
+  ВЫ УВИДИТЕ: под fortio-server 2/2 — приложение и istio-proxy.
+
+    OVERRIDES='{"metadata":{"annotations":{"proxy.istio.io/config":'
+    OVERRIDES+='"{\"holdApplicationUntilProxyStarts\":true}"}}}'
+    k1 run fortio-client --rm -i --restart=Never -n with-sidecar --image=fortio/fortio \
+      --overrides="$OVERRIDES" -- load -qps 200 -t 20s -c 8 http://fortio-server:8080/echo
+  ЗАЧЕМ: тот же тест, но трафик идёт через два прокси (клиент и сервер).
+  ВЫ УВИДИТЕ: отчёт fortio; сравните RPS и p99 с шагом 7.
+
+    echo "Сравните: RPS и p99 без mesh vs со sidecar. Разница — цена mesh'а на один запрос."
+  ВЫ УВИДИТЕ: как правило, RPS ниже, p99 выше на единицы миллисекунд.
+
+ШАГ 9. Ограничиваем область выдачи xDS ресурсом Sidecar
+
+    cat <<'EOF' | k1 apply -n bookinfo -f -
+    apiVersion: networking.istio.io/v1
+    kind: Sidecar
+    metadata:
+      name: productpage-scope
+    spec:
+      workloadSelector:
+        labels:
+          app: productpage
+      egress:
+        - hosts:
+            - "bookinfo/reviews.bookinfo.svc.cluster.local"
+    EOF
+
+    k1 rollout restart deployment -n bookinfo productpage-v1
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: Sidecar ограничивает, какие сервисы вообще попадают в конфигурацию прокси.
+  ВЫ УВИДИТЕ: поды пересозданы.
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$POD" -c istio-proxy -- \
+      curl -s localhost:15000/clusters | grep -c "outbound|"
+  ВЫ УВИДИТЕ: число кластеров заметно меньше, чем на шаге 4.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: на стенде страница может остаться 200 (productpage переживает отсутствие
+  details/ratings), но в конфигурации этих сервисов уже нет. Главный критерий — число
+  кластеров упало (на стенде 1804 → 65). Это цена слишком узкой области: конфигурация
+  меньше, но приложение частично сломано.
+
+    k1 delete sidecar productpage-scope -n bookinfo
+    k1 rollout restart deployment -n bookinfo productpage-v1
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ВЫ УВИДИТЕ: после возврата Sidecar-ресурса productpage снова работает, 200.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+    k1 get hpa -n istio-system
+    k1 top pods -n istio-system -l app=istiod
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: HPA существует, метрики istiod доступны, bookinfo 2/2, HTTP 200.
+  Сохраните выводы fortio в ~/perf-report.txt: они понадобятся для вопросов.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: k1 top nodes: "error: Metrics API not available"
+ПРИЧИНА: metrics-server не установлен или не готов.
+ЧТО ДЕЛАТЬ:
+  1. Проверить: k1 get pods -n kube-system | grep metrics-server.
+  2. Проверить APIService: k1 get apiservice v1beta1.metrics.k8s.io.
+  3. Установить по setup-guide.md, раздел "metrics-server".
+
+ПРОБЛЕМА: HPA показывает TARGETS <unknown>
+ПРИЧИНА: HPA не может получить метрики пода.
+ЧТО ДЕЛАТЬ:
+  1. k1 describe hpa istiod -n istio-system | tail -20.
+  2. Проверить metrics-server (предыдущий пункт).
+  3. Подождать 1–2 минуты: первые метрики появляются не сразу.
+
+ПРОБЛЕМА: fortio-client падает с ошибкой подключения
+ПРИЧИНА: сервер ещё не готов либо неверное имя сервиса.
+ЧТО ДЕЛАТЬ:
+  1. k1 get pods,svc -n no-mesh (или with-sidecar).
+  2. Проверить, что сервис слушает 8080: k1 get endpoints fortio-server -n no-mesh.
+  3. Повторить запуск клиента после того, как сервер Ready.
+
+ПРОБЛЕМА: число кластеров после Sidecar не уменьшилось
+ПРИЧИНА: Sidecar не применился к поду или под не пересоздан.
+ЧТО ДЕЛАТЬ:
+  1. k1 get sidecar -n bookinfo.
+  2. Проверить селектор: k1 get pod -n bookinfo --show-labels | grep productpage.
+  3. Пересоздать поды: k1 rollout restart deployment -n bookinfo productpage-v1.
+
+ПРОБЛЕМА: после удаления Sidecar productpage не восстановился
+ПРИЧИНА: поды не пересозданы или конфигурация ещё не разошлась.
+ЧТО ДЕЛАТЬ:
+  1. k1 rollout restart deployment -n bookinfo productpage-v1.
+  2. k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s.
+  3. istioctl analyze -n bookinfo.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Повторите бенчмарк с `-c 32` (32 соединения) и `-qps 0` (без ограничения скорости). Сравните,
+  как меняется разница между «без mesh» и «со sidecar»: где mesh стоит дороже — на латентности
+  или на пропускной способности? Сохраните оба отчёта в ~/perf-report.txt.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Почему `time kubectl run` — плохой способ мерить latency mesh'а?
+  2. Какие ресурсы Envoy задаются аннотациями и как выбрать значение concurrency?
+  3. Что произойдёт с HPA istiod, если metrics-server недоступен?
+  4. Почему Sidecar-ресурс может сломать приложение, хотя «оптимизирует» конфигурацию?
+  5. Чем ограничение области xDS отличается от «lazy xDS» во внешних реализациях?
+
+УБОРКА
+    k1 delete namespace tuned no-mesh with-sidecar --ignore-not-found
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      k1 delete namespace "load-$i" --ignore-not-found
+    done
+    helm upgrade istiod istio/istiod -n istio-system --version 1.25.2 --reuse-values \
+      --set pilot.autoscaleEnabled=false --wait
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: тестовые namespace'ы удалены, istiod в одной реплике — baseline восстановлен.
+  Отчёт fortio сохраните, он нужен для итогового обсуждения.
+
+ЧТО ДАЛЬШЕ
+  Это последняя работа перед итоговым кейсом. В нём вы получите mesh с несколькими
+  неизвестными поломками и должны будете диагностировать их, восстановить работу и написать
+  пост-мортем — уже без пошаговых подсказок.

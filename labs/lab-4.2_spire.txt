@@ -1,0 +1,371 @@
+Лабораторная работа 4.2: SPIRE как внешний CA
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        4. Безопасность
+РАБОТА:        4.2
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     hard
+ТИП:           individual
+СОСТОЯНИЕ ДО:  Istio 1.25.2 (Helm, ревизия 1-25), bookinfo с sidecar, mesh в STRICT
+СОСТОЯНИЕ ПОСЛЕ: baseline курса: Helm-ревизия 1-25, bookinfo в mesh, SPIRE удалён
+СЛЕДУЮЩАЯ:     lab-4.3_vault.txt
+
+ЦЕЛИ РАБОТЫ
+  - Поставить SPIRE (server, agent, controller manager, SPIFFE CSI driver) и зарегистрировать
+    идентичности для sidecar и ingress gateway через ClusterSPIFFEID.
+  - Установить Istio с trustDomain example.org и CSI-монтированием SPIFFE-сокета в поды.
+  - Доказать, что SVID подписан SPIRE: entries, proxy-config secret, openssl.
+  - Вернуть стенд в baseline скриптом reset-istio.sh.
+
+ЧТО МЫ СДЕЛАЕМ
+  Снимем Helm-установку Istio (istioctl не может усыновить чужие ресурсы), поднимем SPIRE
+  в namespace spire-server, опишем регистрации через ClusterSPIFFEID и поставим Istio по
+  IstioOperator-манифесту: trustDomain example.org, шаблон инъекции с CSI-томом, патч gateway.
+  Затем вернём bookinfo в mesh, развернём под с SPIRE-identity и проверим его SVID. В конце
+  удалим SPIRE и вернём baseline скриптом reset-istio.sh.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin по ssh, cluster-1, Helm 3, istioctl 1.25.2, дистрибутив ~/istio-1.25.2.
+  - Интернет на admin (чарты spiffe.github.io) и на узлы (образы ghcr.io/spiffe, docker.io/istio).
+  - Утилиты на admin: jq и openssl (проверка SVID), sed.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем baseline и инструменты:
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: у каждого пода READY 2/2 — приложение и istio-proxy.
+
+    helm list -n istio-system
+  ВЫ УВИДИТЕ: три релиза: istio-base, istio-ingress, istiod.
+
+    istioctl version
+  ВЫ УВИДИТЕ: client version 1.25.2 и control plane version 1.25.2.
+
+    jq --version
+    openssl version
+  ВЫ УВИДИТЕ: версии jq и OpenSSL. Если jq нет — установите: sudo apt install -y jq.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Кто выпускает сертификаты. По умолчанию CA встроен в istiod: он создаёт self-signed root
+  и подписывает SVID рабочих нагрузок. Такой CA доверяет только Kubernetes — namespace плюс
+  ServiceAccount. За пределами кластера (ВМ, другой кластер, bare metal) подтвердить identity нечем.
+
+  SPIFFE — стандарт identity для распределённых систем. Identity задаётся URI
+  spiffe://<trust domain>/ns/<namespace>/sa/<serviceAccount>. SPIRE — реализация стандарта:
+  SPIRE Server хранит CA и регистрации, SPIRE Agent работает на каждом узле и подтверждает,
+  кто именно просит сертификат (node и workload attestation). Выданный сертификат — SVID.
+
+  Как SPIRE связан с Envoy. Istio умеет обнаружить UNIX-сокет SDS на стандартном пути
+  /var/run/secrets/workload-spiffe-uds/socket и брать identity оттуда вместо istiod. Сокет
+  монтируется в под через SPIFFE CSI driver (том csi.spiffe.io). Без CSI-тома и без шаблона
+  inject.istio.io/templates: "sidecar,spire" под получит обычный сертификат istiod.
+
+  Регистрации. SPIRE выдаёт identity только зарегистрированным workload'ам. ClusterSPIFFEID —
+  CRD SPIRE Controller Manager: описывает selector (namespace, ServiceAccount, метка пода) и
+  шаблон SPIFFE ID. Istio требует формат spiffe://<trustDomain>/ns/<ns>/sa/<sa>, поэтому шаблон
+  всегда одинаковый. Trust domain в SPIRE и в Istio обязан совпадать, иначе mTLS не заработает:
+  поэтому IstioOperator задаёт meshConfig.trustDomain: example.org.
+
+ШАГ 1. Убираем Helm-установку Istio
+
+    helm list -n istio-system
+  ЗАЧЕМ: зафиксировать, что стенд ставился Helm'ом. Helm-ресурсы istioctl не сможет «усыновить»
+  и упадёт на конфликте владельца, поэтому ставим control plane заново.
+  ВЫ УВИДИТЕ: три релиза: istio-base, istio-ingress, istiod.
+
+    helm uninstall istio-ingress istiod istio-base -n istio-system
+  ВЫ УВИДИТЕ: три строки removed. Helm не удаляет CRD из каталога crds/:
+  они останутся в кластере, а istioctl install обновит их. Все CR (Gateway,
+  VirtualService, Telemetry) при этом удаляются вместе с namespace istio-system
+  и namespace bookinfo при следующей установке создаются заново.
+
+    k1 delete namespace istio-system --ignore-not-found
+    k1 get namespace istio-system
+  ВЫ УВИДИТЕ: Error from server (NotFound) — namespace удалён, место для новой установки свободно.
+
+ШАГ 2. Ставим SPIRE
+
+    helm upgrade --install -n spire-server spire-crds spire-crds \
+      --repo https://spiffe.github.io/helm-charts-hardened/ --create-namespace
+  ЗАЧЕМ: spire-crds ставит CRD SPIRE, включая ClusterSPIFFEID; namespace создаётся здесь.
+  ВЫ УВИДИТЕ: Release "spire-crds" does not exist. Installing it now. STATUS: deployed.
+
+    helm upgrade --install -n spire-server spire spire \
+      --repo https://spiffe.github.io/helm-charts-hardened/ --wait --timeout 10m \
+      --set global.spire.trustDomain="example.org" \
+      --set spire-server.persistence.type=emptyDir \
+      --set spiffe-oidc-discovery-provider.enabled=false \
+      --set spire-agent.socketAlternate.image.registry=docker.io \
+      --set spire-agent.socketAlternate.image.repository=library/busybox \
+      --set spire-agent.socketAlternate.image.tag=1.36
+  ЗАЧЕМ: одним чартом ставятся server, agent, controller manager и SPIFFE CSI driver.
+  Trust domain задаём сразу: SPIRE и Istio должны видеть один и тот же example.org.
+  emptyDir нужен на стенде без StorageClass; OIDC-provider в этой работе не нужен,
+  а его init-контейнер зависит от агента. Образ cgr.dev/chainguard/bash в некоторых
+  сетях отдаёт 403, поэтому init-контейнеры агента берут busybox из Docker Hub.
+  ВЫ УВИДИТЕ: STATUS: deployed, REVISION: 1.
+
+    k1 get pods -n spire-server
+  ВЫ УВИДИТЕ: spire-server-0 1/1, spire-controller-manager-xxxxx 1/1, spire-agent-xxxxx по
+  одному на узел и spire-spiffe-csi-driver-xxxxx на каждом узле.
+
+ШАГ 3. Описываем регистрации через ClusterSPIFFEID
+
+    k1 apply -f - <<'EOF'
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ClusterSPIFFEID
+    metadata:
+      name: istio-ingressgateway-reg
+    spec:
+      spiffeIDTemplate: >-
+        spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
+      workloadSelectorTemplates:
+        - "k8s:ns:istio-system"
+        - "k8s:sa:istio-ingressgateway-service-account"
+    EOF
+
+    k1 apply -f - <<'EOF'
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ClusterSPIFFEID
+    metadata:
+      name: istio-sidecar-reg
+    spec:
+      spiffeIDTemplate: >-
+        spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
+      podSelector:
+        matchLabels:
+          spiffe.io/spire-managed-identity: "true"
+      workloadSelectorTemplates:
+        - "k8s:ns:bookinfo"
+    EOF
+  ЗАЧЕМ: SPIRE выдаёт SVID только зарегистрированным. Controller manager смотрит на
+  ClusterSPIFFEID и создаёт entry, когда появляется подходящий под.
+  Первый объект — для ingress gateway в istio-system, второй — для sidecar в bookinfo.
+  ВЫ УВИДИТЕ: clusterspiffeid.spire.spiffe.io/istio-ingressgateway-reg created
+  и clusterspiffeid.spire.spiffe.io/istio-sidecar-reg created.
+
+ШАГ 4. Готовим IstioOperator с CSI-монтированием
+
+    cat > ~/istio-spire.yaml <<'EOF'
+    apiVersion: install.istio.io/v1alpha1
+    kind: IstioOperator
+    metadata:
+      namespace: istio-system
+    spec:
+      profile: default
+      meshConfig:
+        trustDomain: example.org
+      values:
+        sidecarInjectorWebhook:
+          templates:
+            spire: |
+              labels:
+                spiffe.io/spire-managed-identity: "true"
+              spec:
+                containers:
+                  - name: istio-proxy
+                    volumeMounts:
+                      - name: spire
+                        mountPath: /run/secrets/workload-spiffe-uds
+                        readOnly: true
+                volumes:
+                  - name: spire
+                    csi:
+                      driver: "csi.spiffe.io"
+                      readOnly: true
+      components:
+        ingressGateways:
+          - name: istio-ingressgateway
+            enabled: true
+            label:
+              istio: ingressgateway
+            k8s:
+              overlays:
+              - apiVersion: apps/v1
+                kind: Deployment
+                name: istio-ingressgateway
+                patches:
+                - path: spec.template.spec.volumes.[name:spire]
+                  value:
+                    name: spire
+                    csi:
+                      driver: "csi.spiffe.io"
+                      readOnly: true
+                - path: spec.template.spec.containers.[name:istio-proxy].volumeMounts.[name:spire]
+                  value:
+                    name: spire
+                    mountPath: "/run/secrets/workload-spiffe-uds"
+                    readOnly: true
+    EOF
+  ЗАЧЕМ: три изменения в установке. meshConfig.trustDomain — общая доверенная область.
+  Шаблон spire — то, что вебхук инъекции добавит поду с аннотацией inject.istio.io/templates:
+  метку для ClusterSPIFFEID, CSI-том и его монтирование в istio-proxy. Патчи в components
+  делают то же самое для gateway: он не инжектируется, а рендерится чартом.
+  ВЫ УВИДИТЕ: файл ~/istio-spire.yaml создан; вывода у команды нет.
+  ПРОВЕРИТЬ НА СТЕНДЕ: в Istio 1.25.2 native sidecars по умолчанию выключены, и на
+  проверенном стенде (Kubernetes 1.36) istio-proxy остаётся в spec.containers — шаблон
+  использует containers. Если в вашей сборке native sidecars включены, проверьте
+  фактическое место sidecar и поменяйте шаблон:
+    k1 get pod -n bookinfo <pod> -o jsonpath='{.spec.initContainers[*].name}'
+  Если istio-proxy в initContainers — в шаблоне spire нужны initContainers, иначе под
+  не создастся (вебхук добавит второй init-контейнер без образа).
+
+ШАГ 5. Устанавливаем Istio с внешним CA
+
+    istioctl install --skip-confirmation -f ~/istio-spire.yaml
+  ЗАЧЕМ: применить IstioOperator целиком: control plane, gateway и шаблон инъекции.
+  ВЫ УВИДИТЕ: Installing, затем Installation complete и строку с profile default.
+
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: istiod-xxxxx 1/1 и istio-ingressgateway-xxxxx 1/1. Пода istiod-1-25 от Helm нет:
+  менеджер установки теперь один — istioctl. Gateway стартует дольше: CSI-том монтируется
+  до запуска контейнеров, поэтому pod ждёт, пока SPIFFE CSI driver подготовит сокет.
+
+    k1 get configmap istio -n istio-system -o yaml | grep trustDomain
+  ВЫ УВИДИТЕ: trustDomain: example.org — mesh сменил доверенную область с cluster.local.
+
+ШАГ 6. Возвращаем bookinfo в mesh
+
+    k1 label namespace bookinfo istio.io/rev- --overwrite
+    k1 label namespace bookinfo istio-injection=enabled --overwrite
+  ЗАЧЕМ: новая установка istioctl не имеет ревизии, поэтому метку ревизии 1-25 заменяем
+  на istio-injection=enabled.
+  ВЫ УВИДИТЕ: namespace/bookinfo labeled (две строки).
+
+    k1 rollout restart deployment -n bookinfo
+    k1 rollout status deployment -n bookinfo --timeout=300s
+  ЗАЧЕМ: поды получат сертификаты от новой установки. Старые поды помнят другой root
+  и с ним работать не смогут.
+  ВЫ УВИДИТЕ: deployment "xxxxx" successfully rolled out для всех деплойментов.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: снова READY 2/2 у каждого пода.
+
+ШАГ 7. Разворачиваем workload с SPIRE-identity
+
+    sed 's|image: curlimages/curl|image: curlimages/curl:8.10.1|' \
+      ~/istio-1.25.2/samples/security/spire/curl-spire.yaml | k1 apply -f - -n bookinfo
+  ЗАЧЕМ: применить штатный пример из дистрибутива: SA curl, сервис и под с меткой
+  spiffe.io/spire-managed-identity и аннотацией inject.istio.io/templates: "sidecar,spire".
+  Тот же пример есть в документации 1.25. sed фиксирует тег образа — в примере его нет.
+  ВЫ УВИДИТЕ: serviceaccount/curl created, service/curl created, deployment.apps/curl created.
+
+    k1 wait --for=condition=Ready pod -l app=curl -n bookinfo --timeout=300s
+  ВЫ УВИДИТЕ: pod/curl-xxxxx condition met, у пода READY 2/2 — контейнеры curl и istio-proxy,
+  том CSI смонтирован. Если под висит в ContainerCreating — см. «ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК».
+
+ШАГ 8. Проверяем, что SVID выпустил SPIRE
+
+    SPIRE_SERVER_POD=$(k1 get pod -n spire-server \
+      -l statefulset.kubernetes.io/pod-name=spire-server-0 \
+      -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n spire-server "$SPIRE_SERVER_POD" -c spire-server -- \
+      /opt/spire/bin/spire-server entry show
+  ЗАЧЕМ: посмотреть регистрации, которые controller manager создал автоматически.
+  ВЫ УВИДИТЕ: записи с SPIFFE ID от example.org — среди них gateway
+  (spiffe://example.org/ns/istio-system/sa/istio-ingressgateway-service-account), под curl
+  и остальные поды bookinfo, которым ClusterSPIFFEID выдал identity (обычно ~15 записей).
+
+    CURL_POD=$(k1 get pod -n bookinfo -l app=curl -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config secret "$CURL_POD" -n bookinfo -o json > svid.json
+    jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes' \
+      svid.json | base64 -d > chain.pem
+  ЗАЧЕМ: вытащить цепочку сертификатов, которой Envoy реально пользуется. Эту команду
+  даёт документация 1.25; имя пода берём через POD=, а не через -l у exec.
+  ВЫ УВИДИТЕ: два файла: svid.json и chain.pem. Ошибок быть не должно.
+
+    openssl x509 -in chain.pem -noout -issuer -ext subjectAltName
+  ЗАЧЕМ: issuer показывает CA, а SAN — SPIFFE identity. У SPIRE 1.15 subject
+  рабочего сертификата пустой, поэтому проверять надо issuer и SAN, а не CN.
+  ВЫ УВИДИТЕ: issuer=O=example.org (trust domain SPIRE) и
+  URI:spiffe://example.org/ns/bookinfo/sa/curl. У сертификата от istiod
+  issuer был бы O=cluster.local.
+
+ШАГ 9. Убираем SPIRE и возвращаем baseline
+
+    k1 delete deployment/curl service/curl serviceaccount/curl -n bookinfo --ignore-not-found
+  ЗАЧЕМ: сначала workload с CSI-томом, иначе удаление драйвера подвесит под в Terminating.
+  ВЫ УВИДИТЕ: deployment.apps "curl" deleted, service "curl" deleted и ещё одна строка deleted.
+
+    helm delete -n spire-server spire
+    helm delete -n spire-server spire-crds
+    k1 delete namespace spire-server --ignore-not-found
+  ВЫ УВИДИТЕ: release "spire" uninstalled, release "spire-crds" uninstalled, namespace deleted.
+
+    rm -f ~/istio-spire.yaml svid.json chain.pem
+    bash ~/istio-course/scripts/reset-istio.sh
+  ЗАЧЕМ: вернуть стенд к baseline курса: Helm-ревизия 1-25, bookinfo в mesh.
+  ВЫ УВИДИТЕ: скрипт удаляет Istio, ставит Helm-релизы и перезапускает bookinfo;
+  последние строки — списки подов istio-system и bookinfo.
+
+    source ~/istio-course/scripts/env.sh
+  ЗАЧЕМ: пересчитать INGRESS_HOST после пересоздания gateway.
+  ВЫ УВИДИТЕ: команда без вывода; echo "$INGRESS_HOST" покажет IP MetalLB.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки:
+    helm list -n istio-system
+    k1 get pods -n bookinfo
+    k1 get pods -n spire-server
+  ВЫ УВИДИТЕ: три релиза (istio-base, istio-ingress, istiod), bookinfo 2/2,
+  No resources found in spire-server namespace.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: под curl в статусе ContainerCreating, в событиях FailedMount с драйвером csi.spiffe.io
+ПРИЧИНА: SPIFFE CSI driver не готов, не установлен или не видит ClusterSPIFFEID: драйвер
+монтирует сокет только для зарегистрированных workload'ов.
+ЧТО ДЕЛАТЬ:
+  1. Проверить драйвер: k1 get pods -n spire-server | grep csi.
+  2. Проверить регистрации: k1 get clusterspiffeid и k1 get pod -n bookinfo --show-labels.
+  3. Посмотреть события пода: k1 describe pod -n bookinfo -l app=curl | tail -20.
+
+ПРОБЛЕМА: под curl не появляется или Envoy не стартует, в логах istio-proxy нет SVID
+ПРИЧИНА: шаблон инъекции не применился: нет аннотации inject.istio.io/templates, namespace
+без istio-injection, либо шаблон не совпадает с режимом sidecar (containers/initContainers).
+ЧТО ДЕЛАТЬ:
+  1. Проверить аннотацию и метку: k1 get pod -n bookinfo -l app=curl -o yaml | grep -A2 templates.
+  2. Проверить метку namespace: k1 get namespace bookinfo --show-labels.
+  3. Проверить режим: k1 get pod -n bookinfo -l app=curl \
+       -o jsonpath='{.spec.initContainers[*].name}'.
+     Если istio-proxy в initContainers — в шаблоне spire нужны initContainers; если в
+     spec.containers — containers. После правки повторить установку.
+
+ПРОБЛЕМА: spire-server entry show пуст, SVID обычный (istiod), mTLS между сервисами ломается
+ПРИЧИНА: identity не зарегистрирована: не совпали selector'ы (namespace, ServiceAccount, метка)
+или trust domain SPIRE не равен trustDomain Istio.
+ЧТО ДЕЛАТЬ:
+  1. Проверить trust domain SPIRE: k1 exec -n spire-server "$SPIRE_SERVER_POD" -c spire-server
+     -- /opt/spire/bin/spire-server healthcheck. И Istio: k1 get configmap istio -n istio-system.
+  2. Сверить, что под curl попал в bookinfo и имеет метку spiffe.io/spire-managed-identity.
+  3. Пересоздать ClusterSPIFFEID после исправления селектора: k1 delete clusterspiffeid
+     istio-sidecar-reg и применить заново.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Уберите у deployment/curl аннотацию inject.istio.io/templates, пересоздайте под и повторите
+  проверку SVID из шага 8. Объясните, почему subject сертификата изменился и какой CA его выпустил.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем attestation в SPIRE отличается от проверки namespace и ServiceAccount в istiod?
+  2. Зачем нужен SPIFFE CSI driver и что произойдёт, если монтировать сокет через hostPath?
+  3. Что описывает ClusterSPIFFEID и кто создаёт по нему регистрации в SPIRE Server?
+  4. Почему trust domain в SPIRE и Istio должен совпадать?
+  5. Как отличить SVID от SPIRE и SVID от istiod по содержимому сертификата?
+
+УБОРКА
+  Уборка выполнена в шаге 9: workload curl, SPIRE (два Helm-релиза и namespace) удалены,
+  reset-istio.sh вернул Helm-baseline. На стенде остаётся:
+  - Istio 1.25.2: Helm-релизы istio-base, istiod (ревизия 1-25), istio-ingress;
+  - bookinfo с sidecar, namespace помечен istio.io/rev=1-25;
+  - политик безопасности нет: удаление istio-system в шаге 1 сняло STRICT из работы 4.1.
+  Проверить состояние:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+
+ЧТО ДАЛЬШЕ
+  Мы увидели, как identity приходит из внешнего SPIFFE-провайдера, и потренировали полную замену
+  control plane. В работе 4.3 сделаем следующий шаг: отдадим istiod сертификаты из Vault PKI,
+  а приложению — секреты через Vault Agent Injector, и разберём StatefulSet с headless-сервисом.

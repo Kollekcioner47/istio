@@ -1,0 +1,338 @@
+Лабораторная работа 6.1: Multicluster primary-remote
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        6. Multicluster и Mesh Expansion
+РАБОТА:        6.1
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     hard
+ТИП:           individual
+СОСТОЯНИЕ ДО:  Istio 1.25.2 (Helm, ревизия 1-25) на cluster-1, bookinfo с sidecar в mesh,
+               cluster-2 собран и отвечает через k2, MetalLB на cluster-1
+СОСТОЯНИЕ ПОСЛЕ: mesh из двух кластеров: cluster-1 — primary (mesh1, network1) с east-west
+               gateway и выставленным istiod, cluster-2 — remote, bookinfo в обоих кластерах
+СЛЕДУЮЩАЯ:     lab-6.2_mesh_expansion.txt
+
+ЦЕЛИ РАБОТЫ
+  - Перевести cluster-1 в режим primary multicluster и объяснить, что меняется в istiod.
+  - Поднять east-west gateway и открыть через него istiod для второго кластера.
+  - Подключить cluster-2 профилем remote и подтвердить статус synced командой remote-clusters.
+  - Увидеть, как общий service discovery объединяет endpoints двух кластеров.
+
+ЧТО МЫ СДЕЛАЕМ
+  Соберём один mesh из двух кластеров. На cluster-1 включим multicluster-режим, поставим
+  east-west gateway и через него откроем istiod. Затем настроим cluster-2 как remote: там
+  останется только data plane, а управление будет из cluster-1. В конце развернём bookinfo
+  во втором кластере и убедимся, что endpoints сервиса reviews содержат поды из обоих
+  кластеров, а трафик реально уходит за пределы первого кластера.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh и рабочий cluster-1 в baseline.
+  - cluster-2 собран: master4 10.0.2.15 и node3 10.0.2.16, k2 get nodes отвечает.
+  - API-сервер cluster-2 доступен с admin: kubeconfig ~/.kube/config-cluster2.
+  - MetalLB на cluster-1: east-west gateway должен получить внешний IP.
+  - Интернет не нужен: дистрибутив Istio 1.25.2 и Helm-чарты уже на admin.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Оба кластера отвечают:
+    k1 get nodes
+    k2 get nodes
+  ВЫ УВИДИТЕ: cluster-1 — три control plane и два worker в статусе Ready; cluster-2 —
+  master4 и node3 в статусе Ready.
+
+  Istio стоит только на cluster-1, bookinfo в mesh:
+    istioctl version
+    istioctl proxy-status | head -5
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: client и control plane 1.25.2, строки proxy-status в статусе SYNC,
+  у подов bookinfo READY 2/2.
+
+  На cluster-2 Istio ещё не установлен:
+    k2 get pods -n istio-system
+  ВЫ УВИДИТЕ: сообщение, что namespace istio-system не найден. Это исходная точка.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  В топологии primary-remote control plane один. istiod работает только в primary-кластере
+  (cluster-1), а remote-кластер (cluster-2) содержит лишь прокси и приложения. Так проще
+  сопровождать: обновляем один istiod, а политики и service discovery — общие для обоих.
+
+  Чтобы remote мог жить без своего control plane, нужны три вещи.
+  Первое — externalIstiod: istiod на primary соглашается обслуживать внешние кластеры
+  и берёт на себя их webhook'и.
+  Второе — east-west gateway: отдельный Envoy на primary, через который remote ходит к
+  istiod. Это не обычный ingress для пользователей, а служебный вход для кластеров; на нём
+  открыты порты 15443 (трафик между нагрузками), 15012 (xDS) и 15017 (injection webhook).
+  Третье — remote secret: kubeconfig кластера cluster-2, положенный секретом в cluster-1.
+  Через него istiod читает API второго кластера: находит поды, создаёт webhook'и, раздаёт
+  сертификаты.
+
+  Service discovery в multicluster сквозной: сервис reviews есть в обоих кластерах, istiod
+  видит оба набора подов и раздаёт всем прокси объединённый список endpoints. Трафик между
+  подами разных кластеров идёт напрямую (cluster-1 и cluster-2 в одной сети network1),
+  без дополнительного шлюза.
+
+ШАГ 1. Проверяем, что cluster-2 пуст и доступен
+
+    k2 get nodes
+    k2 get ns
+  ЗАЧЕМ: убедиться, что второй кластер собран и что Istio там действительно нет.
+  ВЫ УВИДИТЕ: два узла Ready; среди namespace нет istio-system.
+
+ШАГ 2. Включаем multicluster-режим на cluster-1
+
+    helm --kubeconfig "$KUBECONFIG_CLUSTER1" upgrade istiod istio/istiod -n istio-system \
+      --version 1.25.2 --reuse-values \
+      --set global.meshID=mesh1 \
+      --set global.externalIstiod=true \
+      --set global.multiCluster.clusterName=cluster1 \
+      --set global.network=network1 \
+      --wait
+  ЗАЧЕМ: сообщить istiod имя mesh, имя кластера, сеть и разрешить обслуживать внешние
+  кластеры (externalIstiod). Флаг --reuse-values сохраняет ревизию 1-25 и access-логи
+  из baseline, поэтому переустановка не ломает bookinfo.
+  ВЫ УВИДИТЕ: "STATUS: deployed" и "REVISION: 2".
+
+    ISTIOD=$(k1 get deploy -n istio-system -l app=istiod -o jsonpath='{.items[0].metadata.name}')
+    k1 rollout status deployment/"$ISTIOD" -n istio-system --timeout=180s
+    k1 get pods -n istio-system -l app=istiod
+  ВЫ УВИДИТЕ: под istiod в Running.
+
+  После смены clusterName старые sidecar'ы представляются как cluster "Kubernetes"
+  и istiod их не аутентифицирует. Перезапустите их:
+    k1 rollout restart deployment -n bookinfo
+    k1 rollout restart deployment -n istio-system istio-ingressgateway
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=300s
+  Проверьте, что sidecar'ы пережили обновление: istioctl proxy-status покажет SYNC
+  и колонку CLUSTER=cluster1.
+
+ШАГ 3. Ставим east-west gateway на cluster-1
+
+    helm --kubeconfig "$KUBECONFIG_CLUSTER1" install istio-eastwestgateway istio/gateway \
+      -n istio-system --version 1.25.2 --skip-schema-validation \
+      --set name=istio-eastwestgateway \
+      --set revision=1-25 \
+      --set networkGateway=network1 \
+      --wait
+  ЗАЧЕМ: это тот самый служебный шлюз между кластерами. Параметр networkGateway делает
+  два дела: открывает на сервисе порты 15021, 15443, 15012, 15017 и даёт поду метку
+  istio=eastwestgateway, по которой его находят Gateway и VirtualService. Ревизия
+  указывается потому, что control plane установлен с ревизией 1-25.
+  ВЫ УВИДИТЕ: "STATUS: deployed".
+
+    k1 get pods -n istio-system -l istio=eastwestgateway
+    k1 get svc -n istio-system istio-eastwestgateway
+  ВЫ УВИДИТЕ: под 1/1 Running; у сервиса EXTERNAL-IP из пула MetalLB (например
+  192.168.56.240), в PORT(S) — 15021, 15443, 15012, 15017.
+
+    export DISCOVERY_ADDRESS=$(k1 get svc -n istio-system istio-eastwestgateway \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    echo "$DISCOVERY_ADDRESS"
+  ЗАЧЕМ: этот адрес remote-кластер пропишет себе как точку подключения к control plane.
+  ВЫ УВИДИТЕ: IP MetalLB. Если пусто — см. "ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК".
+
+ШАГ 4. Открываем istiod через east-west gateway
+
+    sed -e 's#istiod.istio-system.svc.cluster.local#istiod-1-25.istio-system.svc.cluster.local#g' \
+        -e 's/name: istiod-vs/name: istiod-vs-1-25/' \
+      ~/istio-1.25.2/samples/multicluster/expose-istiod.yaml | \
+      k1 apply -n istio-system -f -
+  ЗАЧЕМ: east-west gateway сам по себе только принимает TLS. Манифест создаёт Gateway
+  на портах 15012 и 15017 и VirtualService, который по SNI-имени
+  istiod-1-25.istio-system.svc разводит трафик на под istiod. В дистрибутиве 1.25.2
+  нет шаблона expose-istiod-rev.yaml.tmpl, поэтому берём expose-istiod.yaml и
+  подставляем ревизию через sed.
+  ВЫ УВИДИТЕ: "gateway.networking.istio.io/istiod-gateway created",
+  "virtualservice.networking.istio.io/istiod-vs-1-25 created".
+
+    k1 get gateway,virtualservice -n istio-system
+  ВЫ УВИДИТЕ: istiod-gateway и istiod-vs-1-25.
+
+ШАГ 5. Готовим cluster-2 под управление cluster-1
+
+    k2 create namespace istio-system
+    k2 annotate namespace istio-system topology.istio.io/controlPlaneClusters=cluster1
+  ЗАЧЕМ: аннотация говорит istiod из cluster-1, что этот кластер нужно взять под
+  управление: патчить webhook'и и обслуживать его поды.
+  ВЫ УВИДИТЕ: "namespace/istio-system created" и "namespace/istio-system annotated".
+
+ШАГ 6. Ставим remote-профиль на cluster-2
+
+    KUBECONFIG="$KUBECONFIG_CLUSTER2" istioctl install \
+      --set profile=remote --set revision=1-25 \
+      --set values.istiodRemote.injectionPath=/inject/cluster/cluster2/net/network1 \
+      --set values.global.remotePilotAddress="$DISCOVERY_ADDRESS" \
+      -y
+  ЗАЧЕМ: профиль remote не ставит свой control plane — только агент, который
+  подключается к istiod на cluster-1 по адресу east-west gateway. injectionPath
+  задаёт путь, по которому webhook второго кластера будет ходить за инъекцией sidecar.
+  ВЫ УВИДИТЕ: "Installation complete".
+
+    k2 get pods -n istio-system
+  ВЫ УВИДИТЕ: "No resources found" — remote-профиль не ставит istiod, только
+  webhook и конфигурацию. Управление осталось на cluster-1, это ожидаемо.
+
+ШАГ 7. Даём cluster-1 доступ к API cluster-2
+
+    KUBECONFIG="$KUBECONFIG_CLUSTER2" istioctl create-remote-secret --name=cluster2 | \
+      k1 apply -f -
+  ЗАЧЕМ: команда пакует kubeconfig второго кластера в секрет и кладёт его в cluster-1.
+  С этого момента istiod видит API cluster-2: поды, сервисы, может создавать webhook'и.
+  ВЫ УВИДИТЕ: "secret/istio-remote-secret-cluster2 created".
+
+    istioctl remote-clusters
+  ЗАЧЕМ: штатная проверка, что istiod реально достучался до второго кластера.
+  ВЫ УВИДИТЕ: две строки — cluster1 и cluster2, в колонке STATUS у обеих "synced",
+  в колонке ISTIOD — имя пода istiod. Если у cluster2 "timeout" — см. разбор ошибок.
+
+ШАГ 8. Разворачиваем bookinfo в cluster-2
+
+    k2 create namespace bookinfo
+    k2 label namespace bookinfo istio.io/rev=1-25
+    k2 apply -f ~/istio-1.25.2/samples/bookinfo/platform/kube/bookinfo.yaml -n bookinfo
+    k2 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: второй экземпляр того же приложения. Сервисы называются так же, как в
+  cluster-1, и именно это позволяет discovery объединить их endpoints.
+  ВЫ УВИДИТЕ: "condition met" для каждого пода.
+
+    k2 get pods -n bookinfo
+  ВЫ УВИДИТЕ: у каждого пода READY 2/2 — sidecar пришёл от istiod cluster-1 через
+  east-west gateway. Это и есть доказательство, что remote-кластер управляется.
+  ПРОВЕРИТЬ НА СТЕНДЕ: метка ревизии istio.io/rev=1-25 в remote-кластере. Документация
+  1.25 для multicluster показывает istio-injection=enabled; у нас control plane с
+  ревизией, поэтому используется istio.io/rev. Если поды 1/1 — см. разбор ошибок.
+
+ШАГ 9. Проверяем сквозной service discovery
+
+    istioctl proxy-status | grep cluster2 | head -5
+  ВЫ УВИДИТЕ: строки подов из cluster-2 — istiod cluster-1 знает и их тоже.
+  В колонке CLUSTER у этих строк стоит cluster2.
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config endpoints "$POD" -n bookinfo \
+      --cluster "outbound|9080||reviews.bookinfo.svc.cluster.local" | grep -c 9080
+  ЗАЧЕМ: посмотреть глазами, что sidecar productpage получил endpoints reviews из
+  обоих кластеров. В bookinfo три версии reviews, то есть по три пода с каждой стороны.
+  ВЫ УВИДИТЕ: число 6. До этой работы было бы 3.
+
+ШАГ 10. Проверяем, что трафик действительно уходит в cluster-2
+
+    for i in $(seq 1 20); do curl -s -o /dev/null "http://$INGRESS_HOST/productpage"; done
+  ЗАЧЕМ: сгенерировать запросы. productpage вызывает reviews, и половина вызовов
+  должна уйти на поды cluster-2: балансировка идёт по всем шести endpoints.
+  ВЫ УВИДИТЕ: команда отработает без вывода за несколько секунд.
+
+    k2 logs -n bookinfo -l app=reviews -c istio-proxy --tail=50 |
+      grep -c '"path":"/reviews'
+  ЗАЧЕМ: access-логи reviews в cluster-2 — прямое доказательство межкластерного трафика.
+  ВЫ УВИДИТЕ: число больше нуля. Если 0 — трафик не уходит во второй кластер, см.
+  "ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК".
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки сразу:
+    istioctl remote-clusters
+    istioctl proxy-config endpoints "$POD" -n bookinfo \
+      --cluster "outbound|9080||reviews.bookinfo.svc.cluster.local" | grep -c 9080
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: оба кластера synced, 6 endpoints, HTTP 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: в istioctl remote-clusters у cluster2 статус timeout
+ПРИЧИНА: istiod на cluster-1 не может достучаться до API-сервера cluster-2. Обычно это
+неверный адрес в секрете (kubeconfig снят с 127.0.0.1), протухшие сертификаты кластера
+или закрытая сеть между admin и master4.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть логи istiod: k1 logs -n istio-system -l app=istiod | grep -i cluster2.
+  2. Проверить адрес в секрете: k1 get secret -n istio-system istio-remote-secret-cluster2
+     -o jsonpath='{.data.cluster2}' | base64 -d | grep server.
+  3. Если там 127.0.0.1 — исправить kubeconfig cluster-2 (~/renew-certs.sh) и
+     повторить шаг 7.
+
+ПРОБЛЕМА: у east-west gateway EXTERNAL-IP в статусе pending
+ПРИЧИНА: MetalLB не выдал адрес сервису LoadBalancer.
+ЧТО ДЕЛАТЬ:
+  1. Проверить пул и поды: k1 get pods -n metallb-system.
+  2. Проверить сервис: k1 get svc -n istio-system istio-eastwestgateway -o wide.
+  3. Без внешнего IP remote-кластер не подключится: сначала восстановить MetalLB,
+     затем переустановить профиль remote на cluster-2 (ШАГ 6) с новым адресом.
+
+ПРОБЛЕМА: поды bookinfo в cluster-2 в статусе 1/1, sidecar не появился
+ПРИЧИНА: не совпала метка инъекции или webhook второго кластера не создан.
+ЧТО ДЕЛАТЬ:
+  1. Проверить метку: k2 get namespace bookinfo --show-labels.
+  2. Проверить webhook: k2 get mutatingwebhookconfiguration | grep istio-sidecar-injector.
+  3. Пересоздать поды: k2 rollout restart deployment -n bookinfo и снова дождаться Ready.
+
+ПРОБЛЕМА: endpoints reviews содержат 3 адреса вместо 6
+ПРИЧИНА: второй экземпляр bookinfo не поднялся либо istiod не увидел его поды.
+ЧТО ДЕЛАТЬ:
+  1. Проверить поды: k2 get pods -n bookinfo.
+  2. Проверить связь с API: istioctl remote-clusters.
+  3. Посмотреть endpoints сервиса в API второго кластера: k2 get endpointslice -n bookinfo
+     -l kubernetes.io/service-name=reviews.
+
+ПРОБЛЕМА: DISCOVERY_ADDRESS пустой и установка remote падает с ошибкой адреса
+ПРИЧИНА: east-west gateway ещё не получил внешний IP к моменту чтения jsonpath, либо
+сервис называется иначе.
+ЧТО ДЕЛАТЬ:
+  1. Подождать и проверить: k1 get svc -n istio-system istio-eastwestgateway.
+  2. Посмотреть релизы: helm --kubeconfig "$KUBECONFIG_CLUSTER1" list -n istio-system.
+  3. Повторить ШАГ 6, явно задав адрес из поля EXTERNAL-IP.
+
+ПРОБЛЕМА: access-логи reviews в cluster-2 пустые, хотя endpoints 6
+ПРИЧИНА: на 20 запросах распределение могло не попасть в remote-поды, либо access-логи
+в mesh не включены.
+ЧТО ДЕЛАТЬ:
+  1. Повторить запросы 50-100 раз.
+  2. Проверить meshConfig: k1 get configmap -n istio-system istio -o yaml | grep accessLog.
+  3. Проверить статус endpoints: istioctl proxy-config endpoints "$POD" -n bookinfo
+     --cluster "outbound|9080||reviews.bookinfo.svc.cluster.local".
+
+ПРОБЛЕМА: endpoints 6, но запросы в cluster-2 висят или дают timeout
+ПРИЧИНА: Calico каждого кластера знает только свои pod-блоки; маршрутов между
+pod-сетями cluster-1 и cluster-2 нет.
+ЧТО ДЕЛАТЬ:
+  1. Определить блоки: k1 get pods -n bookinfo -o wide и k2 get pods -n bookinfo -o wide
+     (IP подов и узел).
+  2. На узлах каждого кластера добавить маршруты к блокам другого кластера через
+     IP узла-владельца, например:
+       sudo ip route replace 10.233.71.0/26 via 10.0.2.16
+       sudo ip route replace 10.233.94.192/26 via 10.0.2.15
+     и симметрично на cluster-2 для блоков cluster-1.
+  3. Повторить 20 запросов и проверить access-логи reviews в cluster-2.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Уберите remote secret и посмотрите, что станет со сквозным discovery:
+    k1 delete secret -n istio-system -l istio/multiCluster=true
+    istioctl remote-clusters
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config endpoints "$POD" -n bookinfo \
+      --cluster "outbound|9080||reviews.bookinfo.svc.cluster.local" | grep -c 9080
+  Объясните, почему поды cluster-2 продолжают работать, но endpoints в cluster-1
+  больше не обновляются. Верните стенд: повторите ШАГ 7 и убедитесь, что endpoints 6.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Зачем в primary-remote нужен externalIstiod, если istiod и так один?
+  2. Почему east-west gateway открывает три порта, а не один?
+  3. Что именно содержит remote secret и почему без него не работает service discovery?
+  4. Почему в cluster-2 нет своего istiod и что тогда обслуживает его webhook инъекции?
+  5. Чем primary-remote отличается от multi-primary и когда выбирают каждый вариант?
+
+УБОРКА
+  Ничего не удаляем: multicluster-стенд нужен следующей работе 6.2, где мы подключим
+  к этому mesh внешнюю виртуальную машину. Убеждаемся, что стенд здоров:
+    istioctl remote-clusters
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+    k2 get pods -n bookinfo
+  В cluster-2 остаются: namespace istio-system с remote-профилем, namespace bookinfo
+  с приложением, east-west gateway и секрет istio-remote-secret-cluster2 в cluster-1.
+  Полный возврат к baseline выполняется в конце работы 6.2.
+
+ЧТО ДАЛЬШЕ
+  Теперь у нас mesh из двух кластеров, но он всё ещё состоит только из подов. В работе
+  6.2 подключим к нему виртуальную машину 10.0.2.20: зарегистрируем её через
+  WorkloadEntry, поставим на неё istio-agent и увидим её в proxy-status наравне с подами.

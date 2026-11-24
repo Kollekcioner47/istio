@@ -1,0 +1,358 @@
+Лабораторная работа 6.2: Mesh Expansion — виртуальная машина в mesh
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        6. Multicluster и Mesh Expansion
+РАБОТА:        6.2
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     hard
+ТИП:           individual
+СОСТОЯНИЕ ДО:  после 6.1: primary-remote собран (remote-clusters synced), east-west gateway
+               с внешним IP, istiod выставлен через него, ВМ 10.0.2.20 доступна по ssh
+СОСТОЯНИЕ ПОСЛЕ: ВМ 10.0.2.20 в mesh как WorkloadEntry legacy-vm, istio-agent запущен,
+               сервис legacy-service отвечает из mesh; в конце — baseline Istio на cluster-1
+СЛЕДУЮЩАЯ:     lab-7.1_ambient.txt
+
+ЦЕЛИ РАБОТЫ
+  - Создать WorkloadEntry, ServiceAccount и Service для нагрузки вне Kubernetes.
+  - Сгенерировать конфигурацию ВМ штатной командой istioctl x workload entry configure.
+  - Поднять на ВМ istio-agent и увидеть её в proxy-status наравне с подами.
+  - Проверить трафик из mesh в приложение на ВМ и вернуть стенд в baseline.
+
+ЧТО МЫ СДЕЛАЕМ
+  Подключим к mesh машину, которая не является подом: ВМ 10.0.2.20 с обычным HTTP-сервисом
+  на порту 8080. Зарегистрируем её через WorkloadEntry, сгенерируем для неё сертификаты и
+  токен, поставим на ВМ пакет istio-sidecar и запустим агент. Затем обратимся к сервису
+  ВМ из пода и убедимся, что трафик идёт через mesh, как к обычному сервису Kubernetes.
+  В конце вернём стенд в baseline, чтобы следующая работа про ambient началась с чистого
+  control plane.
+
+ЧТО ПОНАДОБИТСЯ
+  - Стенд после работы 6.1: istioctl remote-clusters показывает synced для cluster1 и
+    cluster2, east-west gateway имеет внешний IP.
+  - ВМ 10.0.2.20 (Ubuntu) с доступом по ssh с admin; ключ настроен в setup-guide.
+  - На ВМ: python3 и интернет для скачивания пакета istio-sidecar.deb версии 1.25.2.
+  - На admin: дистрибутив ~/istio-1.25.2, istioctl в PATH через env.sh.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Multicluster из работы 6.1 на месте:
+    istioctl remote-clusters
+    k1 get svc -n istio-system istio-eastwestgateway
+  ВЫ УВИДИТЕ: cluster1 и cluster2 в статусе synced; у east-west gateway EXTERNAL-IP
+  из пула MetalLB.
+
+  ВМ доступна и пока не в mesh:
+    ssh engineer@10.0.2.20 hostname
+    ssh engineer@10.0.2.20 "systemctl status istio --no-pager"
+  ВЫ УВИДИТЕ: имя виртуальной машины; "Unit istio.service could not be found" — агента
+  на ВМ ещё нет, это исходная точка.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Istio умеет включать в mesh не только поды. Нагрузка на ВМ описывается объектами
+  Kubernetes: WorkloadEntry — это запись о конкретном экземпляре (адрес, метки, service
+  account, порты), а Service с обычным selector'ом собирает такие записи в endpoints.
+  Отличие от пода только в том, что endpoint — не IP пода, а IP машины.
+
+  Data plane на ВМ — тот же Envoy, но им управляет локальный istio-agent, а не sidecar-
+  инъекция. Агент подключается к istiod, получает через SDS сертификаты и конфигурацию,
+  поднимает Envoy и настраивает iptables на перехват входящего трафика на портах,
+  перечисленных в WorkloadEntry.
+
+  Три вещи, без которых ВМ не заработает. Первая — сертификаты и токен: у ВМ нет
+  kubelet, поэтому их готовит admin командой istioctl x workload entry configure и
+  копирует на машину. Вторая — сеть: ВМ не видит pod- и service-сети кластера, поэтому
+  ходит к istiod через east-west gateway по адресу из файла hosts. Третья — порты:
+  iptables перехватывает только то, что указано в WorkloadEntry, остальное (например,
+  ssh на 22) не трогается.
+
+  Токен, который генерирует istioctl, живёт один час (флаг --tokenDuration). Если
+  готовить конфигурацию и запускать агент с большим перерывом, сертификаты не выдадутся
+  и ВМ не появится в proxy-status — конфигурацию нужно перегенерировать.
+
+ШАГ 1. Фиксируем адрес east-west gateway и узлы
+
+    istioctl remote-clusters
+    export EASTWEST_IP=$(k1 get svc -n istio-system istio-eastwestgateway \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    echo "$EASTWEST_IP"
+  ЗАЧЕМ: этот IP ВМ пропишет у себя для доступа к istiod; без него агент не подключится.
+  ВЫ УВИДИТЕ: оба кластера synced и внешний IP east-west gateway (например
+  192.168.56.240).
+
+ШАГ 2. Создаём ServiceAccount и WorkloadGroup для ВМ
+
+    k1 create serviceaccount legacy-vm -n bookinfo
+    mkdir -p ~/vm-legacy
+  ЗАЧЕМ: service account даёт ВМ identity (SPIFFE-имя) и используется для выпуска
+  сертификата. WorkloadGroup — шаблон, из которого istioctl генерирует файлы конфигурации.
+  ВЫ УВИДИТЕ: "serviceaccount/legacy-vm created", каталог ~/vm-legacy.
+
+    cat > ~/vm-legacy/workloadgroup.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: WorkloadGroup
+metadata:
+  name: legacy-service
+  namespace: bookinfo
+spec:
+  metadata:
+    labels:
+      app: legacy-service
+      version: v1
+  template:
+    serviceAccount: legacy-vm
+    network: network1
+    ports:
+      http: 8080
+EOF
+  ЗАЧЕМ: имя WorkloadGroup совпадает с именем будущего Service — так каноническое имя
+  сервиса в mesh останется legacy-service. Порты http: 8080 говорят агенту, какой
+  входящий порт перехватывать. network1 — сеть кластера из работы 6.1.
+  ВЫ УВИДИТЕ: файл создан, ошибок нет (cat без вывода).
+
+ШАГ 3. Генерируем конфигурацию для ВМ
+
+    istioctl x workload entry configure -f ~/vm-legacy/workloadgroup.yaml \
+      -o ~/vm-legacy/config --clusterID cluster1 --revision 1-25 \
+      --ingressIP "$EASTWEST_IP"
+  ЗАЧЕМ: команда готовит всё, что нужно агенту: mesh.yaml (адрес istiod), cluster.env
+  (namespace, service account, перехватываемые порты), root-cert.pem (корневой CA),
+  istio-token (одноразовый токен) и hosts (строка для /etc/hosts, чтобы имя
+  istiod-1-25.istio-system.svc резолвилось в east-west gateway). Флаг --revision 1-25
+  обязателен: control plane установлен с ревизией, и без него istioctl ищет configmap
+  istio вместо istio-1-25.
+  ВЫ УВИДИТЕ: "Configuration generation into directory /home/engineer/vm-legacy/config
+  was successful" и предупреждение о сгенерированном токене.
+
+    ls -1 ~/vm-legacy/config
+  ВЫ УВИДИТЕ: cluster.env, hosts, istio-token, mesh.yaml, root-cert.pem.
+
+ШАГ 4. Регистрируем ВМ в service registry
+
+    cat > ~/vm-legacy/workloadentry.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: WorkloadEntry
+metadata:
+  name: legacy-vm
+  namespace: bookinfo
+spec:
+  address: 10.0.2.20
+  labels:
+    app: legacy-service
+    version: v1
+  serviceAccount: legacy-vm
+  network: network1
+  ports:
+    http: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-service
+  namespace: bookinfo
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: legacy-service
+EOF
+    k1 apply -f ~/vm-legacy/workloadentry.yaml
+  ЗАЧЕМ: WorkloadEntry сообщает istiod адрес и метки машины; Service с селектором по
+  этим меткам превращает ВМ в endpoint сервиса bookinfo/legacy-service.
+  ВЫ УВИДИТЕ: "workloadentry.networking.istio.io/legacy-vm created" и "service/legacy-service
+  created".
+
+    k1 get workloadentry -n bookinfo
+    k1 get svc -n bookinfo legacy-service
+  ВЫ УВИДИТЕ: legacy-vm с адресом 10.0.2.20 и сервис legacy-service с портом 8080.
+
+ШАГ 5. Копируем конфигурацию на ВМ
+
+    ssh engineer@10.0.2.20 "mkdir -p ~/vm-legacy"
+    scp -r ~/vm-legacy/config engineer@10.0.2.20:~/vm-legacy/
+  ЗАЧЕМ: все файлы, сгенерированные на admin, должны оказаться на машине; каталоги
+  стандартные, их раскладку сделаем следующим шагом.
+  ВЫ УВИДИТЕ: перечисление скопированных файлов, в конце строка про config.
+
+ШАГ 6. Ставим на ВМ агент и раскладываем файлы
+
+    ssh engineer@10.0.2.20
+  Дальше команды выполняются на ВМ (приглашение puppet):
+
+    curl -LO https://storage.googleapis.com/istio-release/releases/1.25.2/deb/istio-sidecar.deb
+    sudo dpkg -i istio-sidecar.deb
+  ЗАЧЕМ: пакет istio-sidecar содержит агент, Envoy и systemd-юнит istio. Версия пакета
+  обязана совпадать с версией control plane — 1.25.2.
+  ВЫ УВИДИТЕ: "Setting up istio-sidecar (1.25.2)" и созданный юнит istio.service.
+
+    sudo mkdir -p /etc/certs /var/run/secrets/tokens /etc/istio/config /etc/istio/proxy
+    sudo mkdir -p /var/run/secrets/istio
+    sudo cp ~/vm-legacy/config/root-cert.pem /etc/certs/root-cert.pem
+    sudo cp ~/vm-legacy/config/root-cert.pem /var/run/secrets/istio/root-cert.pem
+    sudo cp ~/vm-legacy/config/istio-token /var/run/secrets/tokens/istio-token
+    sudo cp ~/vm-legacy/config/cluster.env /var/lib/istio/envoy/cluster.env
+    sudo cp ~/vm-legacy/config/mesh.yaml /etc/istio/config/mesh
+    sudo sh -c 'cat $(eval echo ~$SUDO_USER)/vm-legacy/config/hosts >> /etc/hosts'
+    sudo chown -R istio-proxy /var/lib/istio /etc/certs /etc/istio/proxy /etc/istio/config \
+      /var/run/secrets
+  ЗАЧЕМ: это ровно те пути, по которым агент ищет сертификат, токен, mesh-конфиг и
+  cluster.env. В 1.25.2 агент дополнительно ищет корневой сертификат в
+  /var/run/secrets/istio/root-cert.pem: без второй копии он падает с
+  "root CA file ... does not exist". Строка в /etc/hosts нужна, чтобы имя istiod-1-25.istio-system.svc
+  резолвилось в east-west gateway. chown обязателен: агент работает от пользователя
+  istio-proxy и не должен читать секреты как root.
+  ВЫ УВИДИТЕ: команды выполнятся без вывода; ошибок быть не должно.
+
+    sudo systemctl start istio
+    sudo systemctl status istio --no-pager
+  ЗАЧЕМ: запустить агент и Envoy.
+  ВЫ УВИДИТЕ: "Active: active (running)".
+
+    sudo ip route replace 10.233.0.0/16 via 10.0.2.10
+  ЗАЧЕМ: ВМ не знает pod-сеть cluster-1. Обратный трафик к поду пойдёт через master1
+  (10.0.2.10), который умеет маршрутизировать в Calico. Подсеть сверьте по факту:
+  k1 get pods -A -o wide. На проверенном стенде была 10.233.0.0/16.
+
+    sudo tail -10 /var/log/istio/istio.log
+  ВЫ УВИДИТЕ: строки про "pushed key/cert pair to proxy" и "pushed root cert to proxy" —
+  агент получил сертификат от istiod. Если лог пуст или есть ошибки — см. разбор.
+
+ШАГ 7. Поднимаем приложение на ВМ
+
+    nohup python3 -m http.server 8080 --bind 0.0.0.0 > ~/vm-app.log 2>&1 &
+    curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
+  ЗАЧЕМ: на ВМ должен быть реальный сервис на порту 8080 — иначе регистрация в mesh
+  будет, а отвечать будет нечего. python3 http.server есть в Ubuntu по умолчанию.
+  ВЫ УВИДИТЕ: 200. Локальный запрос идёт через loopback и не перехватывается агентом,
+  поэтому проверка работает даже при включённом перехвате.
+
+ШАГ 8. Проверяем ВМ из mesh
+
+    exit
+  Возвращаемся на admin и смотрим состояние mesh:
+
+    istioctl proxy-status | grep legacy
+  ЗАЧЕМ: ВМ должна появиться в списке прокси, которыми управляет istiod, наравне с подами.
+  ВЫ УВИДИТЕ: строку вида vm-legacy.bookinfo, в статусе SYNC.
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config endpoints "$POD" -n bookinfo \
+      --cluster "outbound|8080||legacy-service.bookinfo.svc.cluster.local" | grep 10.0.2.20
+  ЗАЧЕМ: endpoint сервиса legacy-service — это IP машины, а не пода.
+  ВЫ УВИДИТЕ: строку 10.0.2.20:8080 в статусе HEALTHY.
+
+ШАГ 9. Отправляем трафик из mesh в ВМ
+
+    k1 run -n bookinfo legacy-client --image=busybox:1.36 --restart=Never \
+      --command -- sleep 3600
+    k1 wait --for=condition=Ready pod -n bookinfo legacy-client --timeout=120s
+    k1 exec -n bookinfo legacy-client -- wget -qO- --timeout=5 http://legacy-service:8080/
+    k1 delete pod -n bookinfo legacy-client
+  ЗАЧЕМ: клиент в namespace bookinfo получает sidecar, обращается к сервису по имени, и
+  запрос проходит полный путь: sidecar клиента -> агент на ВМ -> приложение.
+  ВЫ УВИДИТЕ: HTML-листинг каталога, который отдаёт python3 http.server с ВМ.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки сразу:
+    istioctl proxy-status | grep -c legacy
+    k1 get workloadentry -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 1 прокси с именем legacy, WorkloadEntry legacy-vm с адресом 10.0.2.20,
+  HTTP 200 на основном приложении — mesh не сломан.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: istioctl x workload entry configure падает с "configmap istio-ca-root-cert was
+not found" или "configmap istio was not found"
+ПРИЧИНА: в команде не указана ревизия control plane (--revision 1-25) либо namespace
+bookinfo не в mesh нужной ревизии. Команда ищет корневой CA в namespace нагрузки и
+mesh-конфиг istio-1-25 в istio-system.
+ЧТО ДЕЛАТЬ:
+  1. Повторить команду с флагом --revision 1-25.
+  2. Проверить метку namespace: k1 get namespace bookinfo --show-labels.
+  3. Проверить configmap с CA: k1 get configmap -n bookinfo istio-ca-root-cert.
+
+ПРОБЛЕМА: ВМ не появляется в istioctl proxy-status
+ПРИЧИНА: агент не подключился к istiod: неверный адрес в /etc/hosts, закрыт порт 15012
+на east-west gateway, протух токен или не запущен юнит.
+ЧТО ДЕЛАТЬ:
+  1. На ВМ: sudo systemctl status istio и sudo tail -30 /var/log/istio/istio.log.
+  2. Проверить /etc/hosts: grep istiod /etc/hosts — адрес должен совпадать с EASTWEST_IP.
+  3. Проверить доступность: curl -k https://$EASTWEST_IP:15012 (ожидается обрыв TLS,
+     главное — что соединение устанавливается). Если конфигурация готовилась давно —
+     перегенерировать её (ШАГ 3) и повторить ШАГ 6.
+
+ПРОБЛЕМА: endpoint 10.0.2.20 есть, но wget возвращает 503 или timeout
+ПРИЧИНА: приложение на ВМ не слушает порт 8080, либо агент не перехватывает порт.
+ЧТО ДЕЛАТЬ:
+  1. На ВМ: ss -ltnp | grep 8080 — сервер должен слушать 0.0.0.0:8080.
+  2. Проверить перехват: grep ISTIO_INBOUND_PORTS /var/lib/istio/envoy/cluster.env —
+     там должно быть 8080.
+  3. Посмотреть логи приложения: tail -5 ~/vm-app.log.
+
+ПРОБЛЕМА: k1 run падает с ErrImagePull или ImagePullBackOff
+ПРИЧИНА: образ busybox:1.36 не скачан на узлы, интернет на узлах недоступен.
+ЧТО ДЕЛАТЬ:
+  1. Проверить под: k1 describe pod -n bookinfo legacy-client | tail -20.
+  2. Подтянуть образ на узле или использовать другой уже скачанный образ из курса.
+  3. Если под висит в ContainerCreating — проверить, что sidecar успел создаться:
+     k1 get pod -n bookinfo legacy-client -o jsonpath='{.spec.containers[*].name}'.
+
+ПРОБЛЕМА: сервис legacy-service не создаёт endpoints
+ПРИЧИНА: селектор Service не совпадает с метками WorkloadEntry.
+ЧТО ДЕЛАТЬ:
+  1. Сравнить метки: k1 get workloadentry -n bookinfo legacy-vm -o jsonpath='{.spec.labels}'.
+  2. Сравнить селектор: k1 get svc -n bookinfo legacy-service -o jsonpath='{.spec.selector}'.
+  3. Исправить Service или WorkloadEntry и применить заново.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Остановите приложение на ВМ и посмотрите, что изменится:
+    ssh engineer@10.0.2.20 "pkill -f 'http.server 8080'"
+    k1 run -n bookinfo legacy-client2 --rm -i --restart=Never --image=busybox:1.36 \
+      -- wget -qO- --timeout=5 http://legacy-service:8080/
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config endpoints "$POD" -n bookinfo \
+      --cluster "outbound|8080||legacy-service.bookinfo.svc.cluster.local"
+  Объясните, почему endpoint остался в списке, но запрос завершился ошибкой, и чем это
+  отличается от Kubernetes readiness probe. Верните приложение: запустите python3
+  http.server 8080 на ВМ заново.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем WorkloadEntry отличается от Deployment и почему для ВМ нельзя обойтись Service?
+  2. Зачем ВМ нужен файл /etc/hosts и что в нём написано?
+  3. Почему токен из istioctl x workload entry configure имеет ограниченное время жизни?
+  4. Какие порты ВМ перехватывает агент и как это задаётся?
+  5. Почему сертификат для ВМ выдаётся на service account, а не на имя машины?
+
+УБОРКА
+  Сначала снимаем ВМ с mesh. На ВМ:
+    ssh engineer@10.0.2.20
+    sudo systemctl stop istio
+    sudo dpkg -r istio-sidecar
+    pkill -f "http.server 8080"
+    exit
+  Затем на admin удаляем объекты ВМ, второй кластер и возвращаем baseline:
+    k1 delete workloadentry -n bookinfo legacy-vm --ignore-not-found
+    k1 delete service -n bookinfo legacy-service --ignore-not-found
+    k1 delete serviceaccount -n bookinfo legacy-vm --ignore-not-found
+    k2 delete namespace bookinfo --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_CLUSTER2" istioctl uninstall --purge -y
+    k2 delete namespace istio-system --ignore-not-found
+    bash ~/istio-course/scripts/reset-istio.sh
+  ЗАЧЕМ: multicluster и ambient меняют control plane, поэтому перед работой 7.1 стенд
+  приводится к baseline: Istio Helm с ревизией 1-25 и bookinfo с sidecar.
+  ВЫ УВИДИТЕ: в конце скрипта поды istiod и gateway в Running, поды bookinfo 2/2.
+
+    istioctl proxy-status | head -3
+    k1 get pods -n bookinfo
+    source ~/istio-course/scripts/env.sh && echo "$INGRESS_HOST"
+  ВЫ УВИДИТЕ: proxy-status без STALE, поды 2/2, внешний IP ingress gateway.
+
+ЧТО ДАЛЬШЕ
+  Мы научились включать в mesh не только поды: WorkloadEntry, свой агент и сертификаты
+  работают для любой машины. Следующая работа — 7.1: переключим mesh на ambient, где
+  sidecar'ов нет вообще, а L4-трафик обрабатывает ztunnel на каждом узле.

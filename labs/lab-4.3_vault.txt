@@ -1,0 +1,360 @@
+Лабораторная работа 4.3: Vault как CA для istiod и секреты приложения
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        4. Безопасность
+РАБОТА:        4.3
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     hard
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline после 4.2: Helm-ревизия 1-25, bookinfo в mesh, Vault нет
+СОСТОЯНИЕ ПОСЛЕ: baseline после reset-istio.sh: Helm-ревизия 1-25, bookinfo в mesh
+СЛЕДУЮЩАЯ:     lab-5.1_gateway.txt
+
+ЦЕЛИ РАБОТЫ
+  - Поставить Vault в dev-режиме, построить PKI root + intermediate и отдать их istiod
+    через secret cacerts.
+  - Доказать, что рабочие нагрузки получают сертификаты от CA из Vault, а не от встроенного.
+  - Выдать секрет приложению через Vault Agent Injector без пароля в манифесте.
+  - Развернуть StatefulSet с headless-сервисом и TCP-доступом через ServiceEntry; вернуть baseline.
+
+ЧТО МЫ СДЕЛАЕМ
+  Поднимем Vault и включим PKI: root останется внутри Vault, intermediate подпишем там же
+  и соберём из него четыре файла секрета cacerts. После рестарта istiod начнёт подписывать
+  сертификаты workloads этим CA. Затем настроим Kubernetes auth, policy и роль, выдадим секрет
+  поду через Vault Agent Injector, разберём StatefulSet с headless-сервисом и вернём baseline.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin по ssh, cluster-1, Helm 3, istioctl 1.25.2, дистрибутив ~/istio-1.25.2.
+  - Интернет: чарт hashicorp/vault, образы hashicorp/vault, hashicorp/vault-k8s, busybox.
+  - Утилиты на admin: openssl, jq, base64.
+  - Стенд после работы 4.2: Istio в Helm-baseline, bookinfo в mesh.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем baseline и инструменты:
+    helm list -n istio-system
+  ВЫ УВИДИТЕ: три релиза: istio-base, istio-ingress, istiod.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: у каждого пода READY 2/2 — приложение и istio-proxy.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Встроенный CA. istiod сам создаёт self-signed root и подписывает сертификаты workloads.
+  Для эксплуатации это плохо: root-ключ лежит в кластере, сменить CA без разрыва mTLS нельзя.
+  Плагин CA. Если при старте istiod находит в /etc/cacerts четыре файла, он подписывает
+  сертификаты ими: ca-cert.pem — сертификат промежуточного CA, ca-key.pem — его ключ,
+  root-cert.pem — корневой сертификат, cert-chain.pem — ca-cert плюс root. Источник файлов —
+  secret cacerts в istio-system; том необязательный, поэтому секрет можно создать позже
+  и перезапустить istiod.
+
+  Иерархия PKI. Root CA держат в защищённом месте (здесь — в Vault), кластеру выдают
+  intermediate: при утечке его ключа отзывают intermediate, не меняя root. Vault PKI —
+  хранилище, которое выпускает и подписывает сертификаты по API.
+
+  Vault Agent Injector. Mutating webhook смотрит на аннотации пода и добавляет контейнеры
+  vault-agent. Агент аутентифицируется в Vault по ServiceAccount (Kubernetes auth), получает
+  токен по роли и рендерит секрет в файл /vault/secrets/<имя>. Приложение не знает ни адреса
+  Vault, ни пароля — читает файл.
+
+  StatefulSet и headless. Headless-сервис (clusterIP: None) даёт подам стабильные DNS-имена
+  вида db-0.db.bookinfo.svc.cluster.local. TCP-сервис описывают в реестре Istio через
+  ServiceEntry с protocol: TCP: иначе Envoy может принять поток за HTTP и сломать его.
+
+ШАГ 1. Ставим Vault в dev-режиме
+
+    helm repo add hashicorp https://helm.releases.hashicorp.com || true
+    helm repo update
+    # Если репозиторий отдаёт 403 (бывает в закрытых сетях), чарт ставится из GitHub:
+    #   git clone --depth 1 https://github.com/hashicorp/vault-helm.git /tmp/vault-helm
+    #   helm install vault /tmp/vault-helm -n vault --create-namespace --set server.dev.enabled=true
+    helm install vault hashicorp/vault -n vault --create-namespace \
+      --set server.dev.enabled=true --wait
+  ЗАЧЕМ: dev-режим учебный: Vault сразу распакован, root token известен, PKI включается
+  командами. Данные живут в памяти и исчезнут после рестарта пода.
+  ВЫ УВИДИТЕ: NAME: vault, STATUS: deployed.
+
+    k1 get pods -n vault
+  ВЫ УВИДИТЕ: vault-0 1/1 и vault-agent-injector-xxxxx 1/1 — сервер и вебхук инъекции.
+  В dev-режиме root token — root; передаём его в команды через env VAULT_TOKEN.
+
+ШАГ 2. Включаем PKI и создаём root CA
+
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault secrets enable pki
+  ЗАЧЕМ: включить движок pki для выпуска сертификатов.
+  ВЫ УВИДИТЕ: Success! Enabled the pki secrets engine at: pki/.
+
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root \
+      vault secrets tune -max-lease-ttl=87600h pki
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root \
+      vault write pki/root/generate/internal common_name=cluster.local ttl=87600h
+  ЗАЧЕМ: создать self-signed root внутри Vault. Ключ root не покинет Vault: наружу отдадим
+  только intermediate.
+  ВЫ УВИДИТЕ: таблицу Key Value: certificate, issuing_ca, serial_number.
+
+ШАГ 3. Выпускаем intermediate CA
+
+    openssl genrsa -out ca-key.pem 4096
+    openssl req -new -key ca-key.pem -out cluster-ca.csr \
+      -subj "/O=Istio/CN=cluster.local Intermediate Authority"
+  ЗАЧЕМ: ключ и CSR промежуточного CA генерируем у себя: приватный ключ нужен istiod,
+  Vault только подпишет CSR.
+  ВЫ УВИДИТЕ: два файла: ca-key.pem и cluster-ca.csr.
+
+    CSR=$(cat cluster-ca.csr)
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault write \
+      -field=certificate pki/root/sign-intermediate csr="$CSR" ttl=43800h \
+      common_name="cluster.local Intermediate Authority" > ca-cert.pem
+  ЗАЧЕМ: подписать CSR корневым CA в Vault и сохранить сертификат intermediate локально.
+  ВЫ УВИДИТЕ: файл ca-cert.pem; команда не печатает, сертификат уходит в файл.
+
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root \
+      vault read -field=certificate pki/cert/ca > root-cert.pem
+  ВЫ УВИДИТЕ: файл root-cert.pem — корневой сертификат для цепочки доверия.
+
+ШАГ 4. Собираем secret cacerts и перезапускаем istiod
+
+    { cat ca-cert.pem; echo; cat root-cert.pem; } > cert-chain.pem
+    openssl verify -CAfile root-cert.pem ca-cert.pem
+  ЗАЧЕМ: cert-chain.pem — ровно ca-cert плюс root, как в документации Istio
+  «Plug in CA Certificates». Проверка подтверждает, что цепочка сходится.
+  ВЫ УВИДИТЕ: ca-cert.pem: OK.
+
+    k1 create secret generic cacerts -n istio-system \
+      --from-file=ca-cert.pem --from-file=ca-key.pem \
+      --from-file=root-cert.pem --from-file=cert-chain.pem
+  ЗАЧЕМ: имена файлов в секрете фиксированы: istiod читает именно их из /etc/cacerts.
+  ВЫ УВИДИТЕ: secret/cacerts created.
+
+    ISTIOD=$(k1 get deploy -n istio-system -l app=istiod -o jsonpath='{.items[0].metadata.name}')
+    k1 rollout restart deployment "$ISTIOD" -n istio-system
+    k1 rollout status deployment "$ISTIOD" -n istio-system --timeout=180s
+  ЗАЧЕМ: istiod читает CA только при старте, поэтому новый секрет применяется рестартом.
+  ВЫ УВИДИТЕ: deployment "istiod-1-25" successfully rolled out.
+
+ШАГ 5. Проверяем, что сертификаты выпускает CA из Vault
+
+    k1 rollout restart deployment -n bookinfo
+    k1 rollout status deployment/productpage-v1 -n bookinfo --timeout=180s
+  ЗАЧЕМ: перезапускаем всё приложение: старые сертификаты подписаны прежним CA и по новой
+  цепочке доверия не проходят.
+  ВЫ УВИДИТЕ: deployment "productpage-v1" successfully rolled out.
+
+    PRODUCTPAGE_POD=$(k1 get pod -n bookinfo -l app=productpage \
+      -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config secret "$PRODUCTPAGE_POD" -n bookinfo -o json > pp.json
+    jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes' \
+      pp.json | base64 -d > pp-chain.pem
+  ЗАЧЕМ: достать цепочку сертификатов, которой Envoy реально пользуется.
+  ВЫ УВИДИТЕ: файлы pp.json и pp-chain.pem без ошибок.
+
+    openssl x509 -in pp-chain.pem -noout -issuer | grep Intermediate
+  ЗАЧЕМ: issuer рабочего сертификата — тот, кто его подписал. Это и есть проверка нового CA.
+  ВЫ УВИДИТЕ: issuer=CN = cluster.local Intermediate Authority — цепочка идёт от Vault.
+
+ШАГ 6. Настраиваем Vault Agent Injector
+
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault auth enable kubernetes
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault write auth/kubernetes/config \
+      kubernetes_host="https://kubernetes.default.svc"
+  ЗАЧЕМ: Vault должен проверять токены ServiceAccount через API Kubernetes.
+  ВЫ УВИДИТЕ: Success! Enabled kubernetes auth method at: kubernetes/.
+
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault kv put secret/db \
+      username=bookinfo password=S3cretPass
+  ЗАЧЕМ: пароль хранится только в Vault, в манифесте пода его не будет.
+  ВЫ УВИДИТЕ: Key Value в secret/data/db: username и password.
+
+    printf 'path "secret/data/db" {\n  capabilities = ["read"]\n}\n' > db-policy.hcl
+    k1 exec -i -n vault vault-0 -- env VAULT_TOKEN=root vault policy write db - < db-policy.hcl
+  ЗАЧЕМ: policy даёт минимальные права: только чтение одного секрета.
+  ВЫ УВИДИТЕ: Success! Uploaded policy: db.
+
+    k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault write auth/kubernetes/role/db \
+      bound_service_account_names=db bound_service_account_namespaces=bookinfo \
+      policies=db ttl=1h
+  ЗАЧЕМ: роль связывает ServiceAccount db в namespace bookinfo с policy db: чужой SA токен
+  не получит.
+  ВЫ УВИДИТЕ: Success! Data written to: auth/kubernetes/role/db.
+
+ШАГ 7. Разворачиваем StatefulSet с headless-сервисом и ServiceEntry
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: db
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+    - name: tcp-db
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  replicas: 2
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "db"
+        vault.hashicorp.com/agent-inject-secret-config: "secret/data/db"
+        vault.hashicorp.com/service: "http://vault.vault:8200"
+        # init-контейнер vault-agent стартует раньше istio-proxy; без исключения
+        # порта 8200 его трафик уходит в ещё не поднятый Envoy и получает connection refused
+        traffic.sidecar.istio.io/excludeOutboundPorts: "8200"
+    spec:
+      serviceAccountName: db
+      containers:
+        - name: db
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do echo ok | nc -l -p 5432; done"]
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: db-headless
+spec:
+  hosts:
+    - db.bookinfo.svc.cluster.local
+  ports:
+    - number: 5432
+      name: tcp-db
+      protocol: TCP
+  resolution: DNS
+  endpoints:
+    - address: db-0.db.bookinfo.svc.cluster.local
+    - address: db-1.db.bookinfo.svc.cluster.local
+EOF
+  ЗАЧЕМ: четыре объекта. ServiceAccount db — для Vault auth и identity в mesh. Headless-сервис
+  даёт подам DNS-имена. StatefulSet с аннотациями vault.hashicorp.com/ — приложение с секретом
+  из Vault. ServiceEntry описывает TCP-сервис в реестре Istio: protocol TCP не даёт Envoy
+  трактовать поток как HTTP.
+  ВЫ УВИДИТЕ: serviceaccount/db created, service/db created, statefulset.apps/db created,
+  serviceentry.networking.istio.io/db-headless created.
+  ПРОВЕРИТЬ НА СТЕНДЕ: в 1.25 headless-сервис уже есть в реестре Istio, и ServiceEntry
+  с тем же host трактуется как декоратор (NOTE 2 в документации ServiceEntry). Практический
+  эффект проверяем в шаге 8; если listener на 5432 не появился — см. третий блок проблем.
+
+ШАГ 8. Проверяем секрет, listener и TCP-связность
+
+    k1 wait --for=condition=Ready pod -l app=db -n bookinfo --timeout=300s
+  ВЫ УВИДИТЕ: condition met для db-0 и db-1; READY 3/3 — db, istio-proxy и vault-agent.
+
+    DB0=$(k1 get pod -n bookinfo -l app=db -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$DB0" -c db -- cat /vault/secrets/config
+  ЗАЧЕМ: файл отрендерил Vault Agent из секрета secret/data/db.
+  ВЫ УВИДИТЕ: строки data/metadata, в data есть username=bookinfo и
+  password=S3cretPass. В манифесте этих значений нет.
+
+    istioctl proxy-config listeners "$DB0" -n bookinfo | grep 5432
+  ЗАЧЕМ: проверить, что порт 5432 попал в конфигурацию Envoy как TCP-сервис.
+  ВЫ УВИДИТЕ: строку listener с адресом 0.0.0.0 и портом 5432.
+
+    k1 exec -n bookinfo "$DB0" -c db -- sh -c \
+      '(echo ping; sleep 2) | nc -w 4 db-1.db.bookinfo.svc.cluster.local 5432'
+  ЗАЧЕМ: проверить TCP-путь между подами StatefulSet через sidecar. sleep держит
+  соединение открытым, иначе busybox nc закрывает его раньше ответа.
+  ВЫ УВИДИТЕ: ok — ответ второго пода; соединение прошло через mesh.
+
+ШАГ 9. Убираем Vault и возвращаем baseline
+
+    k1 delete serviceentry db-headless statefulset db service db serviceaccount db \
+      -n bookinfo --ignore-not-found
+  ЗАЧЕМ: сначала workload и его сетевые объекты, потом Vault.
+  ВЫ УВИДИТЕ: четыре строки deleted.
+
+    k1 delete secret cacerts -n istio-system
+    helm uninstall vault -n vault
+    k1 delete namespace vault --ignore-not-found
+  ВЫ УВИДИТЕ: secret "cacerts" deleted, release "vault" uninstalled, namespace deleted.
+
+    rm -f ca-*.pem root-cert.pem cert-chain.pem cluster-ca.csr pp.json pp-chain.pem db-policy.hcl
+  ВЫ УВИДИТЕ: команда без вывода — локальные ключи и сертификаты удалены.
+
+    bash ~/istio-course/scripts/reset-istio.sh
+  ЗАЧЕМ: работа меняла CA control plane. Скрипт удаляет istio-system с остатками cacerts,
+  ставит Helm-ревизию 1-25 и возвращает bookinfo в mesh.
+  ВЫ УВИДИТЕ: ход скрипта, в конце — списки подов istio-system и bookinfo.
+
+    source ~/istio-course/scripts/env.sh
+  ВЫ УВИДИТЕ: команда без вывода; env.sh пересчитал INGRESS_HOST после пересоздания gateway.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+    helm list -n istio-system
+    k1 get pods -n bookinfo
+    k1 get pods -n vault
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: три релиза (istio-base, istio-ingress, istiod), bookinfo 2/2,
+  No resources found in vault namespace, 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: istiod после рестарта не поднимается, в логах ошибки чтения CA из /etc/cacerts
+ПРИЧИНА: в secret cacerts не те имена файлов или битый ключ: istiod ждёт ровно ca-cert.pem,
+ca-key.pem, root-cert.pem, cert-chain.pem.
+ЧТО ДЕЛАТЬ:
+  1. Проверить ключи секрета: k1 get secret cacerts -n istio-system -o jsonpath='{.data}'.
+  2. Сверить пару сертификат-ключ: openssl x509 -in ca-cert.pem -noout -modulus и
+     openssl rsa -in ca-key.pem -noout -modulus — значения должны совпасть.
+  3. Посмотреть лог: k1 logs -n istio-system "$ISTIOD" -c discovery | grep -i cacerts.
+
+ПРОБЛЕМА: под db висит в ContainerCreating или Init, в READY не 3/3
+ПРИЧИНА: Vault Agent не получил токен: не совпали ServiceAccount, namespace или роль.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть init-контейнер: k1 logs -n bookinfo db-0 -c vault-agent-init.
+  2. Сверить привязку: k1 exec -n vault vault-0 -- env VAULT_TOKEN=root vault read
+     auth/kubernetes/role/db.
+  3. Проверить адрес в аннотации: vault.hashicorp.com/service должен быть http://vault.vault:8200.
+
+ПРОБЛЕМА: listener на порту 5432 не появился, istioctl analyze предупреждает о дубликате host
+ПРИЧИНА: headless-сервис уже есть в реестре Istio, и ServiceEntry с тем же host — декоратор:
+порты и endpoints из него могут не примениться.
+ЧТО ДЕЛАТЬ:
+  1. Проверить конфигурацию: istioctl proxy-config listeners "$DB0" -n bookinfo.
+  2. Если порта нет, переименовать host в ServiceEntry (например, db-mesh) и добавить
+     workloadSelector по метке app: db либо оставить штатную поддержку headless-сервисов.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Удалите secret cacerts, перезапустите istiod и productpage тем же способом, что в шагах 4-5.
+  Определите по openssl, какой CA теперь подписывает сертификаты, и объясните, почему для
+  смены CA пришлось перезапускать и control plane, и поды приложения.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Зачем нужны четыре файла в secret cacerts и что будет, если положить только ca-cert.pem?
+  2. Почему root CA держат отдельно от intermediate и что даёт такая иерархия?
+  3. Как Vault Agent узнаёт, что под имеет право читать секрет?
+  4. Чем headless-сервис отличается от обычного ClusterIP и зачем он StatefulSet?
+  5. Почему для TCP-сервиса важно указать protocol: TCP в ServiceEntry?
+
+УБОРКА
+  Уборка выполнена в шаге 9: StatefulSet, Service, ServiceAccount, ServiceEntry, secret cacerts
+  и Vault удалены, reset-istio.sh вернул Helm-baseline. Остаётся Istio 1.25.2 (Helm-релизы
+  istio-base, istiod ревизии 1-25, istio-ingress), bookinfo с sidecar и встроенный CA istiod;
+  политик безопасности нет.
+  Проверить состояние:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+
+ЧТО ДАЛЬШЕ
+  Мы прошли всю ось безопасности: mTLS и политики, внешний SPIFFE-провайдер, внешний CA и
+  секреты приложения. В работе 5.1 займёмся северным входом в mesh: Gateway, CORS и JWT/OIDC
+  на ingress gateway.

@@ -1,0 +1,354 @@
+Лабораторная работа 3.3: Circuit breaking, locality и зеркалирование
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        3. Управление трафиком
+РАБОТА:        3.3
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  VS reviews-ab из 3.2, DR reviews-dr с subsets; по одному поду reviews v1-v3
+СОСТОЯНИЕ ПОСЛЕ: reviews-vs 100% v1, ratings-cb удалён, zone-метки и nodeSelector сняты
+СЛЕДУЮЩАЯ:     lab-4.1_security.txt
+
+ЦЕЛИ РАБОТЫ
+  - Настроить circuit breaking на ratings: connectionPool и outlierDetection.
+  - Прочитать статистику Envoy с клиентского пода: клиент ratings — это reviews, не ratings.
+  - Включить locality load balancing по меткам зон на node1 и node2 и увидеть выбор зоны.
+  - Настроить зеркалирование трафика v1 -> v2 и подтвердить копию в статистике Envoy.
+
+ЧТО МЫ СДЕЛАЕМ
+  Ограничим число соединений к ratings и нагрузим сервис параллельными curl: посмотрим
+  на счётчики переполнения очереди в sidecar клиента. Затем разложим reviews по зонам
+  и заставим productpage выбирать ближнюю зону, а в конце включим зеркалирование на v2.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, cluster-1 в состоянии Ready.
+  - bookinfo, Ingress Gateway и аддоны из модуля 2.
+  - Рабочие узлы node1 и node2 (10.0.2.13, 10.0.2.14) — на них ставим метки зон.
+  - VS reviews-ab и DR reviews-dr из работ 3.1-3.2.
+  - Интернет не нужен.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+    k1 get nodes
+  ВЫ УВИДЕТЕ: пять узлов cluster-1 в статусе Ready, среди них node1 и node2.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДЕТЕ: шесть подов в Running, READY 2/2.
+
+    echo "$INGRESS_HOST"
+  ВЫ УВИДЕТЕ: IP из пула MetalLB.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Circuit breaking в Istio — это два независимых механизма.
+
+  connectionPool задаёт лимиты на upstream: maxConnections (TCP-соединения к хосту),
+  http1MaxPendingRequests (запросы, ожидающие соединения), maxRequestsPerConnection.
+  Лимиты применяет Envoy клиента, там же видны счётчики pending_active и pending_overflow.
+  Переполнение очереди — это 503, который Envoy возвращает локально, не обращаясь к upstream.
+
+  outlierDetection — пассивная проверка получателя: после серии 5xx хост выбрасывается
+  из балансировки на baseEjectionTime. Ошибки здесь считаются по ответам upstream,
+  поэтому переполнение очереди к выбросу хоста отношения не имеет.
+
+  Практический вывод: статистику circuit breaking читают на клиенте. Для пути
+  productpage -> reviews -> ratings клиент ratings — это под reviews.
+
+  Locality: у узлов есть метки topology.kubernetes.io/region и zone. Istiod отдаёт
+  эндпоинты вместе с locality, а Envoy держит приоритеты: сначала здоровая локальная
+  зона, затем зона своего региона, затем остальные. Locality включён по умолчанию,
+  но для конкретного сервиса действует только при outlierDetection в его DR.
+
+  Mirroring: копия запроса уходит на зеркальный адресат fire-and-forget, ответ
+  отбрасывается, к Host добавляется суффикс -shadow. Статистика считается по зеркальному
+  кластеру, поэтому копию видно в Envoy, а в браузере пользователя — нет.
+
+ШАГ 1. Проверяем состояние после 3.2 и готовим A/B-трафик
+
+    k1 get virtualservice -n bookinfo
+    k1 get destinationrule -n bookinfo
+  ВЫ УВИДЕТЕ: VS reviews-ab и DR reviews-dr с subsets v1-v3.
+
+  Входим как jason: по A/B-правилу он попадает в reviews v2, а v2 — единственная
+  версия reviews, которая вызывает ratings.
+    curl -s -c /tmp/jason.txt -e "http://$INGRESS_HOST/productpage" \
+      -d "username=jason&passwd=pass" -o /dev/null "http://$INGRESS_HOST/login"
+    curl -s -b /tmp/jason.txt "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+  ВЫ УВИДЕТЕ: reviews-v2. Это клиент ratings, с которого дальше читаем статистику.
+
+ШАГ 2. Включаем circuit breaking на ratings
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ratings-cb
+spec:
+  host: ratings
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 1
+      http:
+        http1MaxPendingRequests: 1
+        maxRequestsPerConnection: 1
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 100
+EOF
+  ЗАЧЕМ: разрешить к ratings не больше одного соединения и одного ожидающего запроса;
+  всё, что сверх, Envoy отбросит.
+  ВЫ УВИДЕТЕ: "destinationrule.networking.istio.io/ratings-cb created".
+
+ШАГ 3. Нагружаем параллельно и читаем статистику с клиента ratings
+
+    POD=$(k1 get pod -n bookinfo -l app=reviews,version=v2 \
+      -o jsonpath='{.items[0].metadata.name}')
+
+    k1 logs -n bookinfo "$POD" -c istio-proxy --tail=100 |
+      grep -c '"response_code":503'
+  ЗАЧЕМ: снять исходное число локальных 503 до нагрузки. В Istio 1.25
+  stats-matcher по умолчанию не отдаёт cluster-статистику, поэтому pending_overflow
+  через `pilot-agent request GET stats` не виден; переполнение видно как 503
+  с response_flags UO в access-логе клиента (reviews-v2).
+  ВЫ УВИДЕТЕ: число, близкое к нулю.
+
+    for i in $(seq 1 20); do
+      curl -s -o /dev/null -b /tmp/jason.txt "http://$INGRESS_HOST/productpage" &
+    done
+    wait
+  ЗАЧЕМ: создать конкуренцию: двадцать параллельных запросов проходят один и тот же
+  путь productpage -> reviews v2 -> ratings.
+  ВЫ УВИДЕТЕ: страницы отдаются за секунды, часть отзывов будет с ошибкой рейтинга.
+
+    k1 logs -n bookinfo "$POD" -c istio-proxy --tail=100 |
+      grep -c '"response_code":503'
+  ВЫ УВИДЕТЕ: число выросло (в логе есть строки с response_flags UO) — это и есть
+  переполнение очереди circuit breaker.
+  ПРОВЕРИТЬ НА СТЕНДЕ: точное число зависит от скорости и планировщика; важно, что
+  оно увеличилось, а не осталось нулём.
+
+  Почему статистика читается с reviews: лимит connectionPool применяется в Envoy клиента,
+  то есть у reviews v2. На поде ratings счётчиков по ratings не будет: он получатель.
+  Под выбираем через POD=: отбор по метке для kubectl exec невозможен, такого флага нет.
+
+ШАГ 4. Проверяем outlierDetection в конфигурации Envoy
+
+    istioctl proxy-config cluster "$POD" -n bookinfo \
+      --fqdn ratings.bookinfo.svc.cluster.local -o json | grep -A6 outlierDetection
+  ЗАЧЕМ: убедиться, что пассивная часть circuit breaking реально попала в конфигурацию.
+  ВЫ УВИДЕТЕ: фрагмент JSON с полями consecutive5xxErrors: 5, interval: 10s,
+  baseEjectionTime: 30s, maxEjectionPercent: 100.
+
+  Реального выброса хоста здесь не будет: 503 от переполнения очереди Envoy создаёт
+  локально, до обращения к ratings. Выброс проверяют на настоящих 5xx (работа 8.1).
+
+ШАГ 5. Locality load balancing по зонам node1 и node2
+
+  Ставим метки зон на рабочие узлы:
+    k1 label node node1 topology.kubernetes.io/zone=zone1 topology.kubernetes.io/region=region1
+    k1 label node node2 topology.kubernetes.io/zone=zone2 topology.kubernetes.io/region=region1
+  ЗАЧЕМ: дать Istio информацию о locality узлов; эндпоинты получат её из EDS.
+  ВЫ УВИДЕТЕ: "node/node1 labeled", "node/node2 labeled".
+
+  Оставляем по одному эндпоинту на зону, иначе выбор зоны не виден:
+    k1 scale deployment reviews-v3 -n bookinfo --replicas=0
+    k1 patch deployment reviews-v1 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":{"topology.kubernetes.io/zone":"zone1"}}}}}'
+    k1 patch deployment reviews-v2 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":{"topology.kubernetes.io/zone":"zone2"}}}}}'
+    k1 rollout status deployment/reviews-v1 -n bookinfo
+    k1 rollout status deployment/reviews-v2 -n bookinfo
+    k1 get pod -n bookinfo -l app=reviews -o wide
+  ВЫ УВИДЕТЕ: reviews-v1 на node1, reviews-v2 на node2. Колонка NODE — это привязка к зоне.
+
+    k1 delete virtualservice reviews-ab -n bookinfo
+  ЗАЧЕМ: locality работает на уровне эндпоинтов сервиса; без VS трафик идёт на все поды
+  reviews, а зону выбирает Envoy.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io \"reviews-ab\" deleted".
+
+    cat > ~/reviews-locality.yaml <<'EOF'
+spec:
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 100
+EOF
+    k1 patch destinationrule reviews-dr -n bookinfo --type=merge \
+      --patch-file ~/reviews-locality.yaml
+  ЗАЧЕМ: locality в mesh включён по умолчанию, но для сервиса политика действует только
+  при заданном outlierDetection в его DestinationRule.
+  ВЫ УВИДЕТЕ: "destinationrule.networking.istio.io/reviews-dr patched".
+
+  Переводим productpage в zone1:
+    k1 patch deployment productpage-v1 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":{"topology.kubernetes.io/zone":"zone1"}}}}}'
+    k1 rollout status deployment/productpage-v1 -n bookinfo
+    for i in $(seq 1 5); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ВЫ УВИДЕТЕ: "5 reviews-v1" — клиент в zone1, ближняя зона zone1.
+
+  Теперь переводим productpage в zone2:
+    k1 patch deployment productpage-v1 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":{"topology.kubernetes.io/zone":"zone2"}}}}}'
+    k1 rollout status deployment/productpage-v1 -n bookinfo
+    for i in $(seq 1 5); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ВЫ УВИДЕТЕ: "5 reviews-v2" — тот же сервис, но ответила другая зона.
+  ПРОВЕРИТЬ НА СТЕНДЕ: сразу после переключения возможен короткий период, пока
+  istiod и Envoy обновляют эндпоинты; повторите цикл через 10 секунд.
+
+  Пока в локальной зоне есть здоровые эндпоинты, трафик идёт туда. Если зона опустеет
+  или эндпоинты начнут отдавать 5xx, произойдёт failover в следующую зону региона.
+
+ШАГ 6. Зеркалируем трафик v1 -> v2
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-mirror
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+      weight: 100
+    mirror:
+      host: reviews
+      subset: v2
+    mirrorPercentage:
+      value: 100
+EOF
+  ЗАЧЕМ: пользователи получают стабильную v1, а сто процентов запросов копируются
+  на v2 — так проверяют новую версию под реальной нагрузкой.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-mirror created".
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage \
+      -o jsonpath='{.items[0].metadata.name}')
+    for i in $(seq 1 10); do
+      curl -s -o /dev/null "http://$INGRESS_HOST/productpage"
+    done
+    curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    V2=$(k1 get pod -n bookinfo -l app=reviews,version=v2 -o jsonpath='{.items[0].metadata.name}')
+    k1 logs -n bookinfo "$V2" -c istio-proxy --tail=100 |
+      grep -c '"path":"/reviews'
+  ВЫ УВИДЕТЕ: страница по-прежнему reviews-v1, а в access-логе reviews-v2 около 10
+  входящих запросов: копии дошли до v2, но их ответы отброшены.
+
+    istioctl proxy-config route "$POD" -n bookinfo -o json | grep -c requestMirror
+  ВЫ УВИДЕТЕ: единицу или больше: зеркальная политика есть в маршруте productpage.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки — circuit breaking, зеркалирование и маршрут:
+    k1 get destinationrule -n bookinfo
+    V2=$(k1 get pod -n bookinfo -l app=reviews,version=v2 -o jsonpath='{.items[0].metadata.name}')
+    k1 logs -n bookinfo "$V2" -c istio-proxy --tail=100 |
+      grep -c '"path":"/reviews'
+    curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+  ВЫ УВИДЕТЕ: ratings-cb и reviews-dr в списке; в access-логе reviews-v2 есть
+  входящие запросы (зеркальные копии); страница отвечает reviews-v1.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: node "node1" not found
+ПРИЧИНА: в кластере другие имена узлов (с доменом или префиксом).
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть фактические имена: k1 get nodes.
+  2. Подставить свои имена в команды k1 label node.
+  3. Проверить результат: k1 get node --show-labels | grep topology.
+
+ПРОБЛЕМА: счётчик pending_overflow не растёт после нагрузки
+ПРИЧИНА: нагрузка последовательная (curl без &), circuit breaker создан не для ratings,
+либо статистика читается не с того пода: лимит применяется в Envoy клиента ratings.
+ЧТО ДЕЛАТЬ:
+  1. Проверить параллельность: в шаге 3 у curl стоит &, затем wait.
+  2. Проверить DR: k1 get destinationrule ratings-cb -n bookinfo -o yaml.
+  3. Читать статистику с reviews-v2: под выбирается через POD=, как в шаге 3.
+
+ПРОБЛЕМА: страница отвечает обеими версиями, зона не выбирается
+ПРИЧИНА: поды reviews или productpage не были пересозданы после установки меток узлов,
+поэтому Envoy не знает locality; либо у сервиса нет outlierDetection в DestinationRule.
+ЧТО ДЕЛАТЬ:
+  1. Проверить привязку подов: k1 get pod -n bookinfo -o wide.
+  2. Перезапустить поды после меток: k1 rollout restart deployment/productpage-v1 -n bookinfo.
+  3. Проверить DR: k1 get destinationrule reviews-dr -n bookinfo -o yaml | grep -A4 outlier.
+  4. Проверить конфигурацию mesh: istioctl analyze -n bookinfo.
+
+ПРОБЛЕМА: в статистике productpage нет кластера v2|reviews или счётчик не растёт
+ПРИЧИНА: VirtualService reviews-mirror не применился, в DR нет subset v2 либо
+host reviews перекрыт другим правилом.
+ЧТО ДЕЛАТЬ:
+  1. Проверить зеркало в Envoy: istioctl proxy-config route "$POD" -n bookinfo
+     -o json | grep requestMirror.
+  2. Проверить список правил: k1 get virtualservice -n bookinfo.
+  3. Проверить subsets: k1 get destinationrule reviews-dr -n bookinfo -o yaml.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Добавьте в ~/reviews-locality.yaml явную политику распределения по зонам:
+  loadBalancer.localityLbSetting.enabled: true и distribute с весами 70/30 между
+  zone1 и zone2. Примените патч и прогоните 20 запросов из productpage в zone1.
+  Объясните, почему распределение изменилось и когда такая настройка нужна.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Какие лимиты задаёт connectionPool и где они применяются?
+  2. Почему статистику circuit breaking читают на поде reviews, а не ratings?
+  3. Чем connectionPool отличается от outlierDetection по источнику ошибок?
+  4. Как Envoy решает, в какую зону отправить запрос, и что вызывает failover?
+  5. Почему для работы locality нужен outlierDetection в DestinationRule?
+  6. Что увидит пользователь при зеркалировании трафика и где искать копию?
+
+УБОРКА
+  Возвращаем стенд в объявленное состояние:
+    k1 delete destinationrule ratings-cb -n bookinfo
+    k1 delete virtualservice reviews-mirror -n bookinfo
+    k1 patch destinationrule reviews-dr -n bookinfo --type=merge \
+      -p '{"spec":{"trafficPolicy":{"outlierDetection":null}}}'
+    k1 patch deployment reviews-v1 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":null}}}}'
+    k1 patch deployment reviews-v2 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":null}}}}'
+    k1 patch deployment productpage-v1 -n bookinfo --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":null}}}}'
+    k1 scale deployment reviews-v3 -n bookinfo --replicas=1
+    k1 label node node1 topology.kubernetes.io/zone- topology.kubernetes.io/region-
+    k1 label node node2 topology.kubernetes.io/zone- topology.kubernetes.io/region-
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-vs
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+      weight: 100
+EOF
+  Проверяем, что осталось:
+    k1 get destinationrule -n bookinfo
+    k1 get virtualservice -n bookinfo
+    curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+  ВЫ УВИДЕТЕ: только reviews-dr; в VS reviews-vs и bookinfo (gateway из 1.1);
+  страница отвечает reviews-v1.
+  Стенд вернулся к baseline 3.1: reviews 100% на v1, зональные метки сняты.
+
+ЧТО ДАЛЬШЕ
+  Модуль 3 закрыт: мы управляем версиями, временем ответа, перегрузкой, зонами
+  и зеркалированием. В работе 4.1 займёмся безопасностью: mTLS между подами
+  и AuthorizationPolicy, которая ограничивает, кто и куда может обращаться.

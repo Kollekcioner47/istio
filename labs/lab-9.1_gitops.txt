@@ -1,0 +1,403 @@
+Лабораторная работа 9.1: GitOps — ArgoCD для управления конфигурацией Istio
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        9. GitOps и Performance Tuning
+РАБОТА:        9.1
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline после 1.2: Istio через Helm rev 1-25, bookinfo и gateway работают
+СОСТОЯНИЕ ПОСЛЕ: ArgoCD установлен, конфиг Istio управляется из Git, ApplicationSet создан и удалён
+СЛЕДУЮЩАЯ:     lab-9.2_performance.txt
+
+ЦЕЛИ РАБОТЫ
+  - Развернуть ArgoCD и подключить его к локальному Git-репозиторию без внешних сервисов.
+  - Перевести Gateway, VirtualService и DestinationRule под управление ArgoCD (auto-sync, self-heal).
+  - Поймать drift, вернуть конфигурацию к состоянию из Git и собрать ApplicationSet.
+
+ЧТО МЫ СДЕЛАЕМ
+  Поднимем ArgoCD, создадим Git-репозиторий с конфигурацией Istio и локальный git-сервер на admin,
+  переведём gateway-объекты bookinfo под управление Application с автоматической синхронизацией,
+  изменим конфигурацию через Git, руками сломаем кластер (drift) и посмотрим, как self-heal вернёт
+  всё как в Git. В конце соберём ApplicationSet — шаблон для нескольких кластеров.
+
+ЧТО ПОНАДОБИТСЯ
+  - Стенд после 1.2, доступ в интернет для манифеста ArgoCD (один раз).
+  - Утилита argocd CLI на admin (ставится в setup-guide).
+  - Git на admin, порт 8080 для UI/API, git daemon на 9418 (setup-guide, раздел 12).
+
+ПРОВЕРКА СТЕНДА
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: istiod 1/1, istio-ingressgateway 1/1; поды bookinfo 2/2.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+    argocd version --client
+    systemctl is-active git-daemon
+    git ls-remote git://10.0.2.5/istio-config.git
+  ВЫ УВИДИТЕ: HTTP 200, версию клиента ArgoCD 2.14+, active и пустой вывод
+  для пустого репозитория (или refs/heads/main, если репозиторий уже наполняли).
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  GitOps — это когда единственный источник истины для конфигурации — Git-репозиторий, а кластер
+  приводят к нему автоматически. В Istio это особенно полезно: VirtualService, DestinationRule и
+  AuthorizationPolicy — обычные Kubernetes-объекты, их можно версионировать и ревьюить как код.
+
+  ArgoCD — контроллер в кластере. Он клонирует репозиторий, рендерит манифесты (Kustomize или Helm)
+  и сравнивает с тем, что в кластере. Расхождение — это drift. Если включён selfHeal, ArgoCD сам
+  возвращает объект к состоянию из Git; если включён auto-sync, он применяет новые коммиты.
+
+  Application — один репозиторий + путь + кластер. ApplicationSet — шаблон, который создаёт
+  Application по списку кластеров.
+
+ШАГ 1. Устанавливаем ArgoCD
+
+    k1 create namespace argocd
+    k1 apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.14.11/manifests/install.yaml
+  ЗАЧЕМ: версия зафиксирована тегом, чтобы через месяц поведение не изменилось.
+  ВЫ УВИДИТЕ: набор объектов created: deployment.apps/argocd-server,
+  statefulset.apps/argocd-application-controller и другие.
+
+    k1 wait --for=condition=Ready pods --all -n argocd --timeout=300s
+  ВЫ УВИДИТЕ: condition met для каждого пода ArgoCD.
+
+ШАГ 2. Получаем пароль администратора и поднимаем доступ к API
+
+    ARGOCD_PASSWORD=$(k1 -n argocd get secret argocd-initial-admin-secret \
+      -o jsonpath='{.data.password}' | base64 -d)
+    echo "$ARGOCD_PASSWORD"
+  ЗАЧЕМ: пароль создаётся случайным при установке, его нужно сохранить в переменную.
+  ВЫ УВИДИТЕ: строку пароля.
+
+    k1 port-forward svc/argocd-server -n argocd 8080:443 >/tmp/argocd-port.log 2>&1 &
+    sleep 5
+    argocd login localhost:8080 --insecure --username admin --password "$ARGOCD_PASSWORD"
+  ЗАЧЕМ: CLI ходит в API ArgoCD через port-forward; --insecure нужен из-за самоподписанного сертификата.
+  ВЫ УВИДИТЕ: "logged in successfully".
+
+ШАГ 3. Готовим Git-репозиторий с конфигурацией Istio
+
+    mkdir -p ~/istio-gitops/overlays/production
+    cd ~/istio-gitops
+    git init -b main
+    git config user.email "engineer@course.local"
+    git config user.name "Engineer"
+  ЗАЧЕМ: -b main сразу задаёт ветку main — иначе git создаст master, а ArgoCD ищет main.
+  ВЫ УВИДИТЕ: "Initialized empty Git repository".
+
+ШАГ 4. Кладём в Git Gateway, VirtualService и DestinationRule
+
+    mkdir -p ~/istio-gitops/overlays/production
+    cat <<'EOF' > ~/istio-gitops/overlays/production/gateway.yaml
+    apiVersion: networking.istio.io/v1
+    kind: Gateway
+    metadata:
+      name: bookinfo-gateway
+      namespace: bookinfo
+    spec:
+      selector:
+        istio: ingressgateway
+      servers:
+        - port:
+            number: 80
+            name: http
+            protocol: HTTP
+          hosts:
+            - "*"
+    EOF
+
+    cat <<'EOF' > ~/istio-gitops/overlays/production/virtualservice.yaml
+    apiVersion: networking.istio.io/v1
+    kind: VirtualService
+    metadata:
+      name: bookinfo
+      namespace: bookinfo
+    spec:
+      hosts:
+        - "*"
+      gateways:
+        - bookinfo-gateway
+      http:
+        - match:
+            - uri:
+                prefix: /productpage
+          route:
+            - destination:
+                host: productpage
+                port:
+                  number: 9080
+    EOF
+
+    cat <<'EOF' > ~/istio-gitops/overlays/production/destinationrule.yaml
+    apiVersion: networking.istio.io/v1
+    kind: DestinationRule
+    metadata:
+      name: productpage
+      namespace: bookinfo
+    spec:
+      host: productpage
+      trafficPolicy:
+        connectionPool:
+          tcp:
+            maxConnections: 100
+    EOF
+  ЗАЧЕМ: это те же объекты, что мы применяли руками, но теперь они живут в Git.
+  ВЫ УВИДИТЕ: файлы созданы, ошибок нет.
+
+ШАГ 5. Собираем Kustomize-overlay для production
+
+    cat <<'EOF' > ~/istio-gitops/overlays/production/kustomization.yaml
+    apiVersion: kustomize.config.k8s.io/v1beta1
+    kind: Kustomization
+    resources:
+      - gateway.yaml
+      - virtualservice.yaml
+      - destinationrule.yaml
+    namespace: bookinfo
+    EOF
+
+    cat ~/istio-gitops/overlays/production/kustomization.yaml
+  ЗАЧЕМ: overlay — точка входа для ArgoCD; один каталог на окружение. Файлы лежат
+  внутри overlay: Kustomize в ArgoCD запрещает resources за пределами своего каталога.
+  ВЫ УВИДИТЕ: содержимое kustomization.yaml.
+
+ШАГ 6. Коммитим и публикуем репозиторий через git daemon
+
+    cd ~/istio-gitops
+    git add .
+    git commit -m "Istio config: gateway, virtualservice, destinationrule"
+
+    git remote add origin git://10.0.2.5/istio-config.git
+    git push -u origin main
+  ЗАЧЕМ: ArgoCD клонирует не локальный каталог, а URL. Git daemon на admin уже поднят
+  в setup-guide (раздел 12) и принимает push: --enable=receive-pack.
+  ВЫ УВИДИТЕ: push прошёл, ветка main создана.
+
+    git ls-remote git://10.0.2.5/istio-config.git
+  ЗАЧЕМ: проверить, что репозиторий доступен по тому адресу, который получит ArgoCD.
+  ВЫ УВИДИТЕ: строку с хешем коммита и refs/heads/main.
+
+ШАГ 7. Освобождаем объекты, которыми раньше управляли руками
+
+    k1 delete virtualservice bookinfo -n bookinfo --ignore-not-found
+    k1 delete gateways.networking.istio.io bookinfo-gateway -n bookinfo --ignore-not-found
+  ЗАЧЕМ: если оставить объекты, созданные kubectl, ArgoCD пометит их как OutOfSync и будет
+  «догонять» состояние. Чистое владение — сразу из Git.
+  ВЫ УВИДИТЕ: объекты удалены; приложение временно недоступно — это на минуту.
+
+  После работы 7.1 в кластере установлены Gateway API CRD, поэтому короткое имя `gateway`
+  в kubectl резолвится в Gateway API и показывает не то. Для Istio-объектов используйте
+  полное имя `gateways.networking.istio.io`.
+
+ШАГ 8. Создаём Application
+
+    cat <<'EOF' | k1 apply -f -
+    apiVersion: argoproj.io/v1alpha1
+    kind: Application
+    metadata:
+      name: istio-config
+      namespace: argocd
+    spec:
+      project: default
+      source:
+        repoURL: git://10.0.2.5/istio-config.git
+        targetRevision: main
+        path: overlays/production
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: bookinfo
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+    EOF
+  ЗАЧЕМ: repoURL — git:// (не file://): ArgoCD работает в поде и не видит домашний каталог admin.
+  ВЫ УВИДИТЕ: application.argoproj.io/istio-config created.
+
+    argocd app get istio-config
+  ВЫ УВИДИТЕ: Health Status: Healthy, Sync Status: Synced (первый sync может занять до минуты).
+
+ШАГ 9. Проверяем, что ArgoCD создал объекты и приложение снова отвечает
+
+    k1 get gateways.networking.istio.io,virtualservice,destinationrule -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: bookinfo-gateway, bookinfo, productpage; HTTP 200.
+
+ШАГ 10. Меняем конфигурацию через Git
+
+    cat <<'EOF' > ~/istio-gitops/overlays/production/virtualservice.yaml
+    apiVersion: networking.istio.io/v1
+    kind: VirtualService
+    metadata:
+      name: bookinfo
+      namespace: bookinfo
+    spec:
+      hosts:
+        - "*"
+      gateways:
+        - bookinfo-gateway
+      http:
+        - match:
+            - uri:
+                prefix: /productpage
+          corsPolicy:
+            allowOrigins:
+              - exact: https://myapp.example.com
+            allowMethods:
+              - GET
+          route:
+            - destination:
+                host: productpage
+                port:
+                  number: 9080
+    EOF
+
+    cd ~/istio-gitops
+    git add .
+    git commit -m "Add CORS policy to bookinfo VirtualService"
+    git push origin main
+  ЗАЧЕМ: изменение попадает в кластер не через kubectl, а через коммит.
+  ВЫ УВИДИТЕ: push прошёл.
+
+    sleep 120
+    argocd app get istio-config --refresh
+    curl -s -X OPTIONS -H "Origin: https://myapp.example.com" \
+      -H "Access-Control-Request-Method: GET" \
+      -D - -o /dev/null "http://$INGRESS_HOST/productpage" | grep -i "access-control"
+  ВЫ УВИДИТЕ: Synced и заголовки access-control-allow-origin в ответе.
+
+ШАГ 11. Ловим drift и смотрим self-heal
+
+    k1 patch destinationrule productpage -n bookinfo --type merge \
+      -p '{"spec":{"trafficPolicy":{"connectionPool":{"tcp":{"maxConnections":999}}}}}'
+
+    argocd app get istio-config
+  ЗАЧЕМ: ручное изменение — это drift; ArgoCD должен его заметить.
+  ВЫ УВИДИТЕ: Sync Status: OutOfSync. Обновление статуса может занять до 3 минут
+  (период опроса ArgoCD); при необходимости нажмите Refresh в UI или повторите команду.
+
+    sleep 180
+    k1 get dr productpage -n bookinfo -o yaml | grep maxConnections
+  ЗАЧЕМ: selfHeal возвращает значение из Git.
+  ВЫ УВИДИТЕ: 100.
+
+ШАГ 12. Собираем ApplicationSet
+
+    k1 delete application -n argocd istio-config --cascade=orphan
+  ЗАЧЕМ: ApplicationSet создаст своё Application на те же объекты; два владельца конфликтуют.
+  --cascade=orphan оставляет Application и объекты в кластере.
+  ВЫ УВИДИТЕ: application deleted.
+
+    cat <<'EOF' | k1 apply -f -
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: istio-multi-cluster
+      namespace: argocd
+    spec:
+      generators:
+        - list:
+            elements:
+              - cluster: cluster-1
+                url: https://kubernetes.default.svc
+      template:
+        metadata:
+          name: 'istio-config-{{cluster}}'
+        spec:
+          project: default
+          source:
+            repoURL: git://10.0.2.5/istio-config.git
+            targetRevision: main
+            path: overlays/production
+          destination:
+            server: '{{url}}'
+            namespace: bookinfo
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+    EOF
+
+    argocd app list
+  ВЫ УВИДИТЕ: приложение istio-config-cluster-1 в статусе Synced.
+  Для второго кластера достаточно добавить элемент в generators и зарегистрировать кластер:
+    argocd cluster add <context-name>
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+    argocd app list
+    k1 get gateways.networking.istio.io,virtualservice -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: istio-config-cluster-1 Synced, объекты на месте, HTTP 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: Application в статусе Unknown / ComparisonError, в описании repo unreachable
+ПРИЧИНА: ArgoCD не может достучаться до git-сервера.
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что git daemon работает: systemctl status git-daemon.
+  2. Проверить репозиторий: git ls-remote git://10.0.2.5/istio-config.git.
+  3. Проверить доступность из кластера: k1 run netcheck --rm -it --image=busybox \
+     --restart=Never -- sh -c "nc -zv 10.0.2.5 9418".
+
+ПРОБЛЕМА: argocd login не подключается
+ПРИЧИНА: port-forward завершился (разрыв ssh, занят порт 8080).
+ЧТО ДЕЛАТЬ:
+  1. Проверить процесс: ps aux | grep "port-forward".
+  2. Перезапустить: k1 port-forward svc/argocd-server -n argocd 8080:443 >/tmp/argocd-port.log 2>&1 &
+  3. Повторить login.
+
+ПРОБЛЕМА: после патча DestinationRule статус остаётся Synced
+ПРИЧИНА: ArgoCD опрашивает Git и кластер раз в 3 минуты; сразу после патча статус ещё старый.
+ЧТО ДЕЛАТЬ:
+  1. Подождать до 180 секунд.
+  2. Обновить вручную: argocd app get istio-config --refresh.
+  3. Проверить патч: k1 get dr productpage -n bookinfo -o yaml | grep maxConnections.
+
+ПРОБЛЕМА: curl к productpage снова 503 после шага 7
+ПРИЧИНА: ArgoCD ещё не создал Gateway/VirtualService или приложение в статусе Progressing.
+ЧТО ДЕЛАТЬ:
+  1. argocd app get istio-config — ждать Synced/Healthy.
+  2. k1 get gateway,virtualservice -n bookinfo.
+  3. istioctl analyze -n bookinfo.
+
+ПРОБЛЕМА: ApplicationSet создаёт приложение, но оно OutOfSync
+ПРИЧИНА: отличается путь (path) или namespace в шаблоне.
+ЧТО ДЕЛАТЬ:
+  1. Проверить path: должен быть overlays/production.
+  2. Проверить, что kustomization.yaml есть в репозитории: git ls-tree -r main --name-only.
+  3. argocd app get istio-config-cluster-1 -o yaml | grep -A5 source.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Добавьте в Git второй overlay `overlays/staging` с другим весом canary (90/10) и создайте для
+  него отдельное Application. Объясните, как один репозиторий обслуживает два окружения без
+  дублирования манифестов.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем GitOps отличается от «kubectl apply из CI»?
+  2. Что такое drift и как selfHeal его устраняет?
+  3. Зачем нужен git-сервер, если репозиторий можно положить локально?
+  4. Чем ApplicationSet удобнее набора отдельных Application?
+  5. Что произойдёт с объектами, если удалить Application с --cascade=true?
+
+УБОРКА
+  Удаляем ApplicationSet и приложения, но оставляем объекты Istio в кластере:
+    k1 delete applicationset istio-multi-cluster -n argocd --cascade=orphan --ignore-not-found
+    k1 delete application -n argocd istio-config-cluster-1 --cascade=orphan --ignore-not-found
+
+  Удаление ApplicationSet может каскадно удалить созданные им Gateway/VirtualService
+  (зависит от версии контроллера). Восстанавливаем baseline явно:
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/networking/bookinfo-gateway.yaml -n bookinfo
+    sleep 5
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+
+  Проверяем, что gateway и VirtualService на месте:
+    k1 get gateways.networking.istio.io,virtualservice -n bookinfo
+
+  ArgoCD оставляем установленным — он не мешает следующим работам.
+
+ЧТО ДАЛЬШЕ
+  Конфигурация теперь живёт в Git и воспроизводится. В работе 9.2 займёмся производительностью:
+  HPA для istiod, лимиты Envoy, честный бенчмарк через fortio и сокращение области выдачи xDS.

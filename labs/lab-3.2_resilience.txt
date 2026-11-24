@@ -1,0 +1,336 @@
+Лабораторная работа 3.2: A/B, задержки, таймауты и повторы
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        3. Управление трафиком
+РАБОТА:        3.2
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  reviews-vs 100% v1 из 3.1, DestinationRule reviews-dr с subsets v1-v3
+СОСТОЯНИЕ ПОСЛЕ: VS reviews-ab: jason на v2, остальные на v1; fault- и timeout-VS удалены
+СЛЕДУЮЩАЯ:     lab-3.3_circuit_breaking.txt
+
+ЦЕЛИ РАБОТЫ
+  - Настроить A/B-маршрутизацию по заголовку end-user и понять, откуда он берётся.
+  - Внедрить задержку 5 секунд на ratings и измерить время ответа через curl -w.
+  - Ограничить время ответа средствами Envoy: timeout 2s и retries.
+  - Разобрать инцидент «timeout больше задержки — 504 не наступает» и вернуть рабочий конфиг.
+
+ЧТО МЫ СДЕЛАЕМ
+  Разведём пользователей по версиям reviews по заголовку end-user, затем смоделируем
+  медленную зависимость: добавим задержку 5 секунд на ratings. Измерим время ответа
+  и увидим, что страница уходит в ошибку раньше, чем reviews успевает ответить.
+  Затем ограничим время ответа на маршруте productpage -> reviews и посмотрим в access-логи
+  sidecar, где появляется 504. В конце разберём инцидент с слишком большим таймаутом.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, cluster-1 в состоянии Ready.
+  - bookinfo, Ingress Gateway и аддоны наблюдаемости из модуля 2.
+  - Включённые access-логи sidecar (meshConfig, работа 2.1): без них не увидим 504.
+  - DestinationRule reviews-dr с subsets v1-v3 (работа 3.1).
+  - Интернет не нужен.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем состояние после 3.1:
+    k1 get destinationrule -n bookinfo
+    k1 get virtualservice -n bookinfo
+  ВЫ УВИДИТЕ: DestinationRule reviews-dr и VirtualService reviews-vs (100% на v1).
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДЕТЕ: 200.
+
+    k1 logs deploy/productpage-v1 -n bookinfo -c istio-proxy --tail=2
+  ВЫ УВИДЕТЕ: строки access-лога Envoy. Если вывод пустой — access-логи не включены,
+  вернитесь к работе 2.1: без них часть проверок этой работы не сработает.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  A/B-тест — это маршрутизация по признаку запроса, а не по весу. В VirtualService
+  правило match проверяет заголовок (например end-user) и отправляет такой запрос
+  в отдельный subset. Первое совпавшее правило выигрывает, остальные запросы идут
+  в правило по умолчанию.
+
+  Важная деталь bookinfo: productpage формирует заголовок end-user из сессии пользователя
+  и не пробрасывает одноимённый входящий заголовок. Поэтому curl -H "end-user: jason"
+  до reviews не доходит — нужен вход через /login и cookie сессии.
+
+  Fault injection — это правило VirtualService на стороне клиента. delay задерживает
+  запрос перед отправкой в upstream, abort возвращает заданный код вместо вызова.
+  Задержка на ratings применяется в sidecar reviews: именно reviews вызывает ratings.
+
+  timeout маршрута — общий бюджет запроса. perTryTimeout — бюджет одной попытки.
+  attempts в retries — число повторов (плюс исходная попытка), retryOn — какие ошибки
+  считать поводом для повтора. Когда на маршруте включён fault, таймауты и повторы
+  этого маршрута отключаются: это сказано в описании HTTPRoute.fault.
+
+  И последнее: у productpage свой таймаут — 3 секунды на попытку и две попытки на reviews.
+  Он живёт в приложении, Istio о нём не знает, и он может сработать раньше Envoy.
+  Поэтому сначала измеряем, потом объясняем.
+
+ШАГ 1. Разводим пользователей по версиям: A/B по заголовку end-user
+
+    k1 delete virtualservice reviews-vs -n bookinfo
+  ЗАЧЕМ: на одном host reviews может работать только один набор маршрутов: сначала
+  освобождаем место для A/B-правила.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io \"reviews-vs\" deleted".
+
+    cat > ~/reviews-ab.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-ab
+spec:
+  hosts:
+  - reviews
+  http:
+  - match:
+    - headers:
+        end-user:
+          exact: jason
+    route:
+    - destination:
+        host: reviews
+        subset: v2
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+EOF
+    k1 apply -n bookinfo -f ~/reviews-ab.yaml
+  ЗАЧЕМ: пользователь jason получает v2, все остальные — стабильную v1.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-ab created".
+
+  Входим как jason и сохраняем cookie сессии:
+    curl -s -c /tmp/jason.txt -e "http://$INGRESS_HOST/productpage" \
+      -d "username=jason&passwd=pass" -o /dev/null "http://$INGRESS_HOST/login"
+  ЗАЧЕМ: только после входа productpage начнёт отправлять в reviews заголовок end-user.
+  ВЫ УВИДЕТЕ: пустой вывод, код ответа не важен: это редирект 302.
+
+    curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    curl -s -b /tmp/jason.txt "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+  ВЫ УВИДЕТЕ: первую строку reviews-v1 (анонимный пользователь), вторую reviews-v2.
+  У jason в блоке отзывов есть чёрные звёзды, у анонимного пользователя звёзд нет.
+
+ШАГ 2. Добавляем задержку 5 секунд на ratings
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ratings-delay
+spec:
+  hosts:
+  - ratings
+  http:
+  - match:
+    - headers:
+        end-user:
+          exact: jason
+    fault:
+      delay:
+        percentage:
+          value: 100
+        fixedDelay: 5s
+    route:
+    - destination:
+        host: ratings
+  - route:
+    - destination:
+        host: ratings
+EOF
+  ЗАЧЕМ: смоделировать медленную зависимость, не трогая код приложения.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/ratings-delay created".
+
+    k1 get virtualservice ratings-delay -n bookinfo
+  ВЫ УВИДЕТЕ: host ratings, в колонке GATEWAYS пусто — правило работает для sidecar.
+
+    curl -s -o /dev/null -w "%{time_total}\n" "http://$INGRESS_HOST/productpage"
+    curl -s -o /dev/null -w "%{time_total}\n" -b /tmp/jason.txt \
+      "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: измерить именно время ответа; утилита time мешает: она печатает свою статистику.
+  ВЫ УВИДЕТЕ: около 0.1 для анонимного пользователя и около 6.0 для jason.
+  ПРОВЕРИТЬ НА СТЕНДЕ: точное значение зависит от внутренних таймаутов productpage,
+  ожидаемый диапазон для jason — 5.8-6.5 секунды.
+
+    curl -s -b /tmp/jason.txt "http://$INGRESS_HOST/productpage" | grep -c unavailable
+  ВЫ УВИДЕТЕ: 1. Блок отзывов заменён сообщением об ошибке.
+
+  Разбор: reviews v2 ждёт ratings 5 секунд и всё же получает ответ. Но productpage ждёт
+  reviews только 3 секунды и делает вторую попытку — итого около 6 секунд и ошибка.
+  Приложение сдалось раньше, чем Envoy вообще начал что-то ограничивать.
+
+ШАГ 3. Ограничиваем время ответа: timeout 2s и retries
+
+    k1 delete virtualservice reviews-ab -n bookinfo
+  ЗАЧЕМ: снова освобождаем host reviews; дальше маршрут один — весь трафик на v2,
+  чтобы не зависеть от cookie.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io \"reviews-ab\" deleted".
+
+    cat > ~/reviews-timeout.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-timeout
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v2
+    timeout: 2s
+    retries:
+      attempts: 2
+      perTryTimeout: 1s
+      retryOn: 5xx
+EOF
+    k1 apply -n bookinfo -f ~/reviews-timeout.yaml
+  ЗАЧЕМ: ограничить ожидание reviews двумя секундами и разрешить повторы.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-timeout created".
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+
+    curl -s -o /dev/null -w "%{time_total} %{http_code}\n" -b /tmp/jason.txt \
+      "http://$INGRESS_HOST/productpage"
+    k1 logs deploy/productpage-v1 -n bookinfo -c istio-proxy --tail=50 |
+      grep -c '"response_code":504'
+    istioctl proxy-config route "$POD" -n bookinfo -o json | grep -c retryPolicy
+  ЗАЧЕМ: увидеть, что таймаут сработал, и где именно он виден.
+  ВЫ УВИДЕТЕ: около 4.0 200; счётчик 504 — единица или больше (обычно 2);
+  счётчик retryPolicy — единица или больше.
+
+  Важно: ratings-delay действует только для end-user=jason, поэтому запросы ниже
+  выполняются с cookie из шага 1. Без cookie задержки нет и 504 не появится.
+
+  Разбор: 504 — это ответ Envoy в productpage на вызов reviews. Приложение получает 504,
+  повторяет операцию целиком (у него две попытки), поэтому суммарно около 4 секунд.
+  Наружу productpage отдаёт 200 с блоком ошибки — поэтому %{http_code} равен 200,
+  а не 504. Access-логи из 2.1 пишутся в JSON, поэтому 504 ищем по полю response_code.
+  Повторы не спасли: каждая попытка упирается в ту же задержку, а общий бюджет 2s
+  выбирается первыми двумя.
+
+ШАГ 4. Инцидент: таймаут больше задержки — 504 не наступает
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-timeout
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v2
+    timeout: 10s
+    retries:
+      attempts: 0
+EOF
+  ЗАЧЕМ: воспроизвести ситуацию, когда таймаут заведомо больше задержки.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-timeout configured".
+
+    curl -s -o /dev/null -w "%{time_total}\n" -b /tmp/jason.txt \
+      "http://$INGRESS_HOST/productpage"
+    k1 logs deploy/productpage-v1 -n bookinfo -c istio-proxy --tail=50 |
+      grep -c '"response_code":504'
+  ВЫ УВИДЕТЕ: около 6.0 секунд. Счётчик 504 может содержать строки от шага 3
+  (tail не очищается); важно, что новых 504 за этот запрос не появляется.
+
+  Разбор: Envoy ждёт 10 секунд и до reviews доходит ответ через 5. Но productpage
+  сдаётся на своём трёхсекундном таймауте, и в access-логе Envoy нет 504 — запрос
+  отменён приложением. Вывод: таймаут Envoy имеет смысл только тогда, когда он меньше
+  задержки; и всегда нужно помнить про таймауты самого приложения. Повторы здесь
+  выключены (attempts: 0), иначе 504 появился бы от исчерпания попыток, а не от timeout.
+
+ШАГ 5. Возвращаем рабочую конфигурацию
+
+    k1 apply -n bookinfo -f ~/reviews-timeout.yaml
+  ЗАЧЕМ: вернуть timeout 2s и retries: это проверенное рабочее состояние.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-timeout configured".
+
+    curl -s -o /dev/null -w "%{time_total}\n" -b /tmp/jason.txt \
+      "http://$INGRESS_HOST/productpage"
+    k1 logs deploy/productpage-v1 -n bookinfo -c istio-proxy --tail=30 |
+      grep -c '"response_code":504'
+  ВЫ УВИДЕТЕ: около 4.0 и снова единица или больше в счётчике 504.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки:
+    k1 get virtualservice -n bookinfo
+    curl -s -o /dev/null -w "%{time_total}\n" -b /tmp/jason.txt \
+      "http://$INGRESS_HOST/productpage"
+    k1 logs deploy/productpage-v1 -n bookinfo -c istio-proxy --tail=30 |
+      grep -c '"response_code":504'
+  ВЫ УВИДЕТЕ: в списке ratings-delay и reviews-timeout; время около 4 секунд;
+  в логе sidecar есть строки с 504.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: curl -H "end-user: jason" возвращает reviews-v1, A/B не работает
+ПРИЧИНА: productpage собирает заголовок end-user из сессии и не пробрасывает входящий
+заголовок в reviews. Прямой заголовок от curl до reviews не доходит.
+ЧТО ДЕЛАТЬ:
+  1. Войти через /login и сохранить cookie: команда curl -c /tmp/jason.txt в шаге 1.
+  2. Повторить запрос с -b /tmp/jason.txt.
+  3. Проверить, что файл cookie существует: ls -l /tmp/jason.txt.
+
+ПРОБЛЕМА: 504 не появляется, хотя timeout выставлен
+ПРИЧИНА: таймаут больше задержки (например 10s при 5s) или у приложения свой,
+более короткий таймаут; либо на маршруте включён fault, а он отключает timeout.
+ЧТО ДЕЛАТЬ:
+  1. Сравнить значения: timeout в VS и fixedDelay в ratings-delay.
+  2. Убедиться, что timeout и fault не в одном http-правиле.
+  3. Вернуть timeout: 2s и attempts: 2 командой из шага 5.
+
+ПРОБЛЕМА: время ответа большое, но счётчик 504 равен нулю
+ПРИЧИНА: access-логи выключены или смотрим не тот под.
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что под с istio-proxy: k1 get pod -n bookinfo -l app=productpage.
+  2. Смотреть логи контейнера istio-proxy, а не приложения: флаг -c istio-proxy.
+  3. Альтернативная проверка без логов: k1 exec -n bookinfo "$POD" -c istio-proxy
+     -- pilot-agent request GET stats | grep "reviews.*upstream_rq_timeout".
+
+ПРОБЛЕМА: задержка не влияет на jason — страница открывается быстро
+ПРИЧИНА: трафик jason уходит не в reviews v2: A/B-правило не применилось, cookie
+не передана или VS ratings-delay создан в другом namespace.
+ЧТО ДЕЛАТЬ:
+  1. Проверить маршрут из шага 1: grep -o "reviews-v[0-9]" должен дать reviews-v2.
+  2. Проверить namespace и host: k1 get vs -n bookinfo.
+  3. Проверить конфигурацию: istioctl analyze -n bookinfo.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Уберите ratings-delay, оставив timeout 2s и retries. Измерьте время ответа
+  и объясните, почему 504 не появляется, хотя таймаут маленький. Верните
+  ratings-delay командой из шага 2.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Откуда в bookinfo берётся заголовок end-user и почему curl -H его не подменяет?
+  2. На каком прокси применяется fault.delay для ratings и почему?
+  3. Чем timeout маршрута отличается от perTryTimeout?
+  4. Почему attempts: 2 не гарантирует две дополнительные попытки?
+  5. Почему клиент получил 200, хотя в access-логе sidecar стоит 504?
+  6. Почему при timeout 10s и задержке 5s 504 не наступает?
+
+УБОРКА
+  Удаляем демонстрационные правила и возвращаем A/B-маршрут:
+    k1 delete virtualservice ratings-delay -n bookinfo
+    k1 delete virtualservice reviews-timeout -n bookinfo
+    k1 apply -n bookinfo -f ~/reviews-ab.yaml
+  Проверяем, что осталось:
+    k1 get virtualservice -n bookinfo
+    curl -s -b /tmp/jason.txt "http://$INGRESS_HOST/productpage" | grep -o "reviews-v[0-9]"
+  ВЫ УВИДЕТЕ: reviews-ab и bookinfo (VS gateway из 1.1); jason снова получает
+  reviews-v2.
+  Осталось: DR reviews-dr с subsets, VS reviews-ab (jason на v2, остальные на v1),
+  файлы ~/reviews-ab.yaml и ~/reviews-timeout.yaml. Fault- и timeout-правила удалены.
+
+ЧТО ДАЛЬШЕ
+  Мы научились управлять временем ответа и повторять запросы. В работе 3.3 защитим
+  сервис от перегрузки: connectionPool и outlier detection, locality load balancing
+  по зонам и зеркалирование трафика на новую версию.

@@ -1,0 +1,347 @@
+Лабораторная работа 2.2: Трейсинг и разбор деградации
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        2. Observability
+РАБОТА:        2.2
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  стенд после 2.1: аддоны Prometheus, Grafana, Kiali и Jaeger работают,
+               access-логи включены, bookinfo с sidecar, трейсинг не включён
+СОСТОЯНИЕ ПОСЛЕ: трейсинг включён (провайдер jaeger и Telemetry mesh-default, sampling 100%),
+               Jaeger собирает трейсы, тестовый VirtualService удалён, все три версии reviews
+               по одной реплике
+СЛЕДУЮЩАЯ:     lab-3.1_traffic.txt
+
+ЦЕЛИ РАБОТЫ
+  - Включить трейсинг через extensionProvider в MeshConfig и объект Telemetry.
+  - Найти в Jaeger трейс запроса productpage и объяснить, из каких спанов он состоит.
+  - По трейсу и метрикам найти причину 503, когда у reviews не осталось endpoints.
+  - Измерить задержку через curl -w и найти, на каком ребре она вставлена.
+
+ЧТО МЫ СДЕЛАЕМ
+  Опишем в MeshConfig провайдера трейсинга и включим его объектом Telemetry с sampling 100%.
+  Сгенерируем трафик, разберём дерево спанов в Jaeger и пройдём два инцидента: 503 после
+  пропажи endpoints у reviews и задержку из первого VirtualService. Причину ищем по трейсам.
+
+ЧТО ПОНАДОБИТСЯ
+  - Стенд после работы 2.1: аддоны Running, access-логи включены, bookinfo 2/2.
+  - Helm-релиз istiod: extensionProvider — поле MeshConfig, его меняют через установку.
+  - Браузер на рабочем месте для Jaeger UI (10.0.2.5:16686/jaeger).
+
+ПРОВЕРКА СТЕНДА
+  Терминал на admin, окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: istiod (или istiod-1-25), gateway и четыре аддона (prometheus, grafana, kiali,
+  jaeger) в статусе Running.
+
+    k1 get telemetry -n istio-system
+  ВЫ УВИДИТЕ: "No resources found in istio-system namespace." — трейсинг ещё не включён.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: шесть подов bookinfo, у каждого READY 2/2.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200. Если 503 — сначала верните стенд по работе 2.1.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Трейс — дерево спанов одного запроса. Спан — операция с началом, концом и атрибутами: в
+  Istio каждый прокси создаёт спан на входящий и на исходящий вызов. Спаны связываются
+  заголовками traceparent и tracestate (для Zipkin-совместимых бэкендов — B3), и приложение
+  обязано их пробрасывать. В bookinfo это уже сделано, поэтому дерево получается связным.
+
+  Трейсинг в Istio 1.25 настраивается двумя объектами. extensionProvider в MeshConfig
+  описывает, куда и по какому протоколу прокси отправляют спаны. CR Telemetry в istio-system
+  включает трейсинг во всём mesh и задаёт sampling: без него провайдер описан, но спаны не
+  уходят. Default sampling равен 1%, поэтому на учебном стенде ставим 100%.
+
+  Для Jaeger из демо-аддона есть два пути: провайдер opentelemetry на jaeger-collector:4317
+  (так в документации 1.25 для Jaeger) и провайдер zipkin на сервис zipkin:9411 (сам аддон
+  публикует его, потому что Jaeger принимает Zipkin API). Идём вторым путём: короче, а
+  результат в Jaeger UI одинаковый.
+
+  Главное для диагностики: трейс показывает, на каком ребре (кто -> кто) ушло время и где
+  вернулась ошибка, но не говорит «почему». Второй шаг — конфигурация (VirtualService,
+  DestinationRule, endpoints) и метрики ребра. 503 в mesh'е — ответ Envoy, а не приложения.
+
+ШАГ 1. Убеждаемся, что трейсов пока нет
+
+    k1 get telemetry -n istio-system
+  ЗАЧЕМ: зафиксировать состояние до настройки: провайдера нет, спаны не уходят.
+  ВЫ УВИДИТЕ: "No resources found in istio-system namespace."
+
+ШАГ 2. Описываем провайдера в MeshConfig
+
+    helm upgrade istiod istio/istiod -n istio-system --version 1.25.2 --reuse-values \
+      --set meshConfig.enableTracing=true \
+      --set meshConfig.extensionProviders[0].name=jaeger \
+      --set meshConfig.extensionProviders[0].zipkin.service=zipkin.istio-system.svc.cluster.local \
+      --set meshConfig.extensionProviders[0].zipkin.port=9411 --wait
+  ЗАЧЕМ: провайдер — адрес и протокол, по которому прокси отдают спаны. Остальное как в 2.1:
+  меняем установку control plane, --reuse-values сохраняет access-логи, --version держит
+  chart 1.25.2. Имя jaeger произвольно, тип zipkin — потому что Jaeger принимает Zipkin API
+  на сервисе zipkin:9411.
+  ВЫ УВИДИТЕ: Release «istiod» has been upgraded, STATUS: deployed.
+  ПРОВЕРИТЬ НА СТЕНДЕ: что спаны действительно доходят до Jaeger через zipkin:9411, а не
+  только появляются в конфигурации прокси.
+
+  Проверяем конфигурацию:
+    k1 get configmap -n istio-system -o yaml | grep -A6 extensionProviders
+  ВЫ УВИДИТЕ: extensionProviders, ниже name: jaeger и zipkin с service и port.
+
+ШАГ 3. Включаем трейсинг и sampling
+
+    k1 apply -f - <<'EOF'
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: jaeger
+      randomSamplingPercentage: 100.0
+EOF
+  ЗАЧЕМ: провайдер описывает бэкенд, а включает трейсинг объект Telemetry. Он создан в
+  корневом namespace istio-system, поэтому действует на весь mesh. sampling поднимаем с 1%
+  до 100%: на учебном стенде трафика мало, при 1% мы почти ничего не увидим.
+  ВЫ УВИДИТЕ: telemetry.telemetry.istio.io/mesh-default created.
+
+    k1 get telemetry -n istio-system
+  ВЫ УВИДИТЕ: mesh-default в списке.
+
+ШАГ 4. Генерируем трафик и смотрим первый трейс
+
+  В отдельном терминале на admin запускаем поток запросов:
+    while true; do
+      curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+      sleep 1
+    done
+  ЗАЧЕМ: без трафика трейсов не будет.
+  ВЫ УВИДИТЕ: поток строк 200. Остановить — Ctrl+C.
+
+  Открываем Jaeger в отдельном терминале:
+    istioctl dashboard jaeger --address 0.0.0.0 --browser=false
+  ЗАЧЕМ: смотреть собранные спаны; --browser=false отключает поиск браузера на сервере.
+  ВЫ УВИДИТЕ: строку http://0.0.0.0:16686 и "skipping opening a browser". Откройте
+  http://10.0.2.5:16686/jaeger — у демо-аддона UI живёт по пути /jaeger.
+
+  В UI выберите Service -> productpage.bookinfo -> Find Traces и откройте свежий трейс.
+  ВЫ УВИДИТЕ: дерево спанов: istio-ingressgateway, productpage.bookinfo, reviews.bookinfo,
+  ratings.bookinfo, details.bookinfo. Верхний спан — сотни миллисекунд, дочерние — единицы.
+
+ШАГ 5. ИНЦИДЕНТ 1. У reviews пропали endpoints
+
+  Пользователи жалуются на страницу без отзывов. Убираем все поды reviews:
+    k1 scale deployment -n bookinfo reviews-v1 --replicas=0
+    k1 scale deployment -n bookinfo reviews-v2 --replicas=0
+    k1 scale deployment -n bookinfo reviews-v3 --replicas=0
+    k1 wait --for=delete pod -l app=reviews -n bookinfo --timeout=120s
+  ЗАЧЕМ: сервис reviews остаётся, но за ним нет ни одного пода — типичная авария после
+  неудачного деплоя.
+  ВЫ УВИДИТЕ: три "scaled" и подтверждение удаления каждого пода.
+
+    curl -s "http://$INGRESS_HOST/productpage" | grep -o "Error fetching product reviews"
+  ВЫ УВИДИТЕ: "Error fetching product reviews" — страница отдалась, но блок отзывов сломан.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200. Это важный момент: код 200 на входе не значит, что всё хорошо. Ошибка
+  случилась внутри, на ребре productpage -> reviews, и productpage её обработал.
+
+ШАГ 6. ИНЦИДЕНТ 1. Ищем причину и восстанавливаем
+
+    k1 get endpoints -n bookinfo reviews
+  ВЫ УВИДИТЕ: reviews и <none> в колонке ENDPOINTS — прокси не знает, куда слать запрос.
+
+  Ищем 503 в access-логах, которые включили в 2.1:
+    k1 logs -n bookinfo -l app=productpage -c istio-proxy --tail=20 | grep 503
+  ВЫ УВИДИТЕ: строки с "response_code":503 и upstream_cluster
+  outbound|9080||reviews.bookinfo.svc.cluster.local.
+
+  Считаем 503 в Prometheus (вкладка Graph):
+    sum(rate(istio_requests_total{response_code="503"}[5m])) by (destination_service_name)
+  ЗАЧЕМ: отделить один сломанный сервис от остальных.
+  ВЫ УВИДИТЕ: строку reviews со значением больше нуля; у других сервисов ошибок нет.
+
+  Смотрим трейс в Jaeger.
+  ВЫ УВИДИТЕ: свежий трейс productpage, где спан вызова reviews помечен ошибкой с кодом 503,
+  а длительность — единицы миллисекунд. Спанов самого reviews в дереве нет: запрос до
+  приложения не дошёл.
+
+  Причина: сервис без endpoints, Envoy вернул 503. Восстанавливаем:
+    k1 scale deployment -n bookinfo reviews-v1 --replicas=1
+    k1 scale deployment -n bookinfo reviews-v2 --replicas=1
+    k1 scale deployment -n bookinfo reviews-v3 --replicas=1
+    k1 wait --for=condition=Ready pods -l app=reviews -n bookinfo --timeout=180s
+  ВЫ УВИДИТЕ: три сообщения "condition met".
+
+    curl -s "http://$INGRESS_HOST/productpage" | grep -c "Error fetching"
+  ВЫ УВИДИТЕ: 0 — ошибка в блоке отзывов ушла.
+
+ШАГ 7. ИНЦИДЕНТ 2. Задержка: первый VirtualService
+
+  Уберём разброс по версиям reviews: у v1 нет вызова ratings, у v3 таймаут на ratings 2,5 с,
+  у v2 — 10 с. Чтобы замер и трейс были одинаковыми, оставим одну версию.
+    k1 scale deployment -n bookinfo reviews-v1 --replicas=0
+    k1 scale deployment -n bookinfo reviews-v3 --replicas=0
+  ЗАЧЕМ: сделать инцидент воспроизводимым, а не зависящим от того, какой под ответил.
+  ВЫ УВИДИТЕ: два "scaled".
+
+  Создаём VirtualService с задержкой:
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ratings-delay
+  namespace: bookinfo
+spec:
+  hosts:
+    - ratings
+  http:
+    - fault:
+        delay:
+          percentage:
+            value: 100
+          fixedDelay: 7s
+      route:
+        - destination:
+            host: ratings
+EOF
+  ЗАЧЕМ: VirtualService — первый объект маршрутизации в курсе, подробно разбираем в 3.1.
+  Здесь нужен один блок: fault.delay вставляет задержку в прокси на клиентской стороне, до
+  того как запрос уйдёт в ratings. Короткое имя ratings резолвится по namespace самого
+  VirtualService, то есть ratings.bookinfo.svc.cluster.local.
+  ВЫ УВИДИТЕ: virtualservice.networking.istio.io/ratings-delay created.
+
+ШАГ 8. ИНЦИДЕНТ 2. Измеряем и ищем ребро задержки
+
+    for i in 1 2 3; do
+      curl -s -o /dev/null -w "%{time_total}\n" "http://$INGRESS_HOST/productpage"
+    done
+  ЗАЧЕМ: -w "%{time_total}" печатает полное время запроса в секундах с микросекундами — так
+  меряют latency в скриптах, без разбора вывода time и без шума прогрева соединений.
+  ВЫ УВИДИТЕ: три значения около 6,0 секунды, хотя задержка в конфигурации 7 секунд. Дело не
+  в стенде: productpage ждёт reviews не дольше 3 секунд и делает один повтор, 3 + 3 = 6
+  секунд, после чего показывает ошибку в блоке отзывов. Это известная особенность bookinfo.
+
+    curl -s "http://$INGRESS_HOST/productpage" | grep -c "Error fetching"
+  ВЫ УВИДИТЕ: 1 — блок отзывов сломан, хотя reviews v2 жив и отвечает.
+
+  В Jaeger отсортируйте трейсы по Duration (самый долгий сверху).
+  ВЫ УВИДИТЕ: трейс около 6 секунд. В нём спан на ребре reviews -> ratings длительностью около
+  7 секунд — та самая задержка; два спана productpage -> reviews примерно по 3 секунды с
+  ошибкой (две попытки, обе оборвал таймаут приложения); серверный спан ratings — единицы
+  миллисекунд. Вывод: время уходит на ребре reviews -> ratings, в ratings задержки нет.
+
+ШАГ 9. ИНЦИДЕНТ 2. Находим конфигурацию и убираем задержку
+
+    k1 get virtualservice -n bookinfo
+  ВЫ УВИДИТЕ: два объекта — bookinfo (из работы 1.1) и ratings-delay (появился только что).
+
+    k1 get virtualservice -n bookinfo ratings-delay -o yaml
+  ВЫ УВИДИТЕ: в spec.http[0].fault.delay стоит fixedDelay: 7s и percentage.value: 100.
+  ЗАЧЕМ: трейс показал ребро, конфигурация показала причину. Типичная ошибка — искать
+  задержку в коде сервиса, хотя её вставил прокси по правилу маршрутизации.
+
+  Убираем задержку и возвращаем версии reviews:
+    k1 delete virtualservice -n bookinfo ratings-delay
+    k1 scale deployment -n bookinfo reviews-v1 --replicas=1
+    k1 scale deployment -n bookinfo reviews-v3 --replicas=1
+    k1 wait --for=condition=Ready pods -l app=reviews -n bookinfo --timeout=180s
+  ВЫ УВИДИТЕ: сообщение deleted и три "condition met".
+
+    for i in 1 2 3; do
+      curl -s -o /dev/null -w "%{time_total}\n" "http://$INGRESS_HOST/productpage"
+    done
+  ВЫ УВИДИТЕ: 0,05-0,30 секунды и ни одной ошибки в блоке отзывов.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки:
+    k1 get telemetry -n istio-system
+  ВЫ УВИДИТЕ: mesh-default — трейсинг включён и остаётся включённым.
+
+    k1 get virtualservice -n bookinfo
+  ВЫ УВИДИТЕ: только bookinfo — тестовый ratings-delay удалён.
+
+    curl -s -o /dev/null -w "%{time_total} %{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: время меньше 0,5 секунды и код 200. В Jaeger по-прежнему есть свежие трейсы
+  по productpage.bookinfo.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: в Jaeger нет трейсов после настройки провайдера и Telemetry.
+ПРИЧИНА: имя провайдера в Telemetry не совпадает с name в extensionProviders; конфигурация не
+доехала до прокси; sampling остался 1%; Jaeger не готов.
+ЧТО ДЕЛАТЬ:
+  1. Сверить Telemetry: k1 get telemetry -n istio-system mesh-default -o yaml.
+  2. Сверить MeshConfig: k1 get configmap -n istio-system -o yaml | grep -A6 extensionProviders.
+  3. Проверить Jaeger и его endpoints: k1 get pods -n istio-system -l app=jaeger,
+     k1 get endpoints zipkin -n istio-system.
+  4. Проверить прокси: istioctl proxy-status — в колонке SYNCed должно быть SYNC.
+  5. Перезапустить поды приложения: k1 rollout restart deployment -n bookinfo.
+
+ПРОБЛЕМА: Jaeger UI отдаёт 404 или пустую страницу на корне.
+ПРИЧИНА: у демо-аддона задан QUERY_BASE_PATH=/jaeger, интерфейс живёт по этому пути.
+ЧТО ДЕЛАТЬ:
+  1. Открыть http://10.0.2.5:16686/jaeger.
+  2. Проверить, что port-forward жив: в терминале admin есть строка "skipping opening a browser".
+
+ПРОБЛЕМА: после scale reviews в 0 страница открывается с отзывами и без ошибок.
+ПРИЧИНА: поды ещё не удалились, либо смотрят из кеша браузера, либо проверяют не тот URL.
+ЧТО ДЕЛАТЬ:
+  1. Проверить поды и endpoints: k1 get pods -n bookinfo, k1 get endpoints -n bookinfo reviews.
+  2. Дождаться удаления: k1 wait --for=delete pod -l app=reviews -n bookinfo --timeout=120s.
+  3. Проверять curl-ом, а не браузером: curl -s "http://$INGRESS_HOST/productpage".
+
+ПРОБЛЕМА: задержка не появилась, страница открывается за 0,1-0,3 секунды.
+ПРИЧИНА: VirtualService создан в другом namespace или с другим хостом; на ratings уже есть
+другое правило; конфигурация ещё не разошлась по прокси.
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что объект в bookinfo: k1 get virtualservice -A | grep ratings-delay.
+  2. Посмотреть все правила на ratings: k1 get virtualservice -n bookinfo -o yaml.
+  3. Проверить конфигурацию: istioctl analyze -n bookinfo.
+  4. Подождать 1-2 секунды и повторить замер: правило приезжает в прокси асинхронно.
+
+ПРОБЛЕМА: задержка в 7 секунд есть, но в Jaeger нет спана на ребре reviews -> ratings.
+ПРИЧИНА: запрос оборван таймаутом приложения раньше, чем прокси успел его завершить, поэтому
+трейс короче и обрезан.
+ЧТО ДЕЛАТЬ:
+  1. Смотреть не последний трейс, а самый долгий: в Jaeger отсортировать по Duration.
+  2. Проверить, что осталась одна версия reviews: k1 get pods -n bookinfo -l app=reviews.
+  3. Искать длительность по access-логам: k1 logs -n bookinfo -l app=reviews -c istio-proxy
+     --tail=20 | grep ratings.
+  4. ПРОВЕРИТЬ НА СТЕНДЕ: точную форму спанов при обрыве клиентом (Envoy может показать один
+     длинный спан вместо двух коротких) — записать наблюдение в отчёт.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Поменяйте sampling и оцените эффект. Поставьте randomSamplingPercentage: 10.0:
+    k1 edit telemetry -n istio-system mesh-default
+  Сгенерируйте 30 запросов:
+    for i in $(seq 1 30); do curl -s -o /dev/null "http://$INGRESS_HOST/productpage"; done
+  Посчитайте в Jaeger трейсы за последние 5 минут и сравните с 30 запросами. Верните 100.0.
+  Объясните, почему в production обычно берут 1-5%, а для разбора инцидента удобнее 100%.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Зачем нужны два объекта — extensionProvider и Telemetry, — и что будет, если создать
+     только первый?
+  2. Что делает randomSamplingPercentage и почему значение по умолчанию 1%?
+  3. Как приложение участвует в трейсинге и что будет, если оно не пробрасывает traceparent?
+  4. Почему 503 от прокси говорит о конфигурации и endpoints, а не о коде сервиса?
+  5. Почему страница открылась за ~6 секунд, если задержка в конфигурации 7 секунд?
+
+УБОРКА
+  Тестовые объекты уже удалены в шагах: ratings-delay и лишние реплики reviews. Ничего больше
+  не удаляем: extensionProvider, Telemetry и аддоны — baseline курса. Остановите Ctrl+C
+  port-forward Jaeger и генератор трафика:
+    k1 get telemetry -n istio-system
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: mesh-default и шесть подов 2/2.
+
+ЧТО ДАЛЬШЕ
+  Трейс научил видеть, где именно уходит время и где рвётся запрос. В работе 3.1 перейдём от
+  разбора к управлению: VirtualService и DestinationRule, subsets версий и канарейка 90/10,
+  которую проверим уже знакомыми метриками и трейсами.

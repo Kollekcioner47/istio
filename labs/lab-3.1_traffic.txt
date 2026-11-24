@@ -1,0 +1,295 @@
+Лабораторная работа 3.1: Версии сервиса и канареечный выкат
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        3. Управление трафиком
+РАБОТА:        3.1
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  Istio demo и bookinfo работают; правил маршрутизации для reviews нет
+СОСТОЯНИЕ ПОСЛЕ: reviews-dr с subsets v1-v3, reviews-vs отправляет 100% трафика на v1
+СЛЕДУЮЩАЯ:     lab-3.2_resilience.txt
+
+ЦЕЛИ РАБОТЫ
+  - Описать версии reviews объектом DestinationRule с subsets v1, v2, v3.
+  - Перевести 100% трафика reviews на v1 и подтвердить это циклом curl к $INGRESS_HOST.
+  - Провести канареечный выкат по весам: 90/10, затем 50/50 между v1 и v2.
+  - Вернуть стенд в baseline: 100% трафика на v1.
+
+ЧТО МЫ СДЕЛАЕМ
+  Сначала посмотрим, как Kubernetes сам раскладывает трафик между версиями reviews:
+  каждая версия — отдельный Deployment, и без правил Istio страница показывает случайную
+  версию. Затем опишем версии в DestinationRule, переведём весь трафик на v1 и будем
+  двигать веса канареечного выката. В конце вернёмся к 100% на v1: это baseline
+  для следующих работ модуля.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, cluster-1 в состоянии Ready.
+  - Istio demo и bookinfo из работы 1.1, Ingress Gateway отвечает по $INGRESS_HOST.
+  - kubectl и istioctl из env.sh, ISTIO_VERSION=1.25.2.
+  - Интернет не нужен: все манифесты создаём в работе.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем приложение:
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: шесть подов в Running, у каждого READY 2/2 (приложение и istio-proxy).
+
+    echo "$INGRESS_HOST"
+  ВЫ УВИДИТЕ: IP из пула MetalLB, например 192.168.56.240.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Kubernetes Service балансирует соединения между подами по IP: приложению всё равно,
+  какая версия ответила. Istio добавляет два объекта, которые разделяют ответственность.
+
+  DestinationRule описывает политики для сервиса (host): наборы эндпоинтов (subsets),
+  балансировку, лимиты соединений, outlier detection, режим TLS. Subset — это фильтр
+  по меткам подов, в bookinfo это version: v1, v2, v3.
+
+  VirtualService описывает маршруты: какие запросы куда отправить. Маршрут сопоставляется
+  по заголовкам и пути, а destination указывает host, subset и weight. В одном правиле
+  можно задать timeout, retries, fault injection и mirror.
+
+  Главное правило: DestinationRule говорит, какие адресаты существуют, VirtualService
+  решает, какой из них получит конкретный запрос. Subset, на который не ссылается ни один
+  маршрут, не используется и на трафик не влияет.
+
+  Веса — это доля запросов, а не сессии: Envoy выбирает взвешенный кластер отдельно
+  для каждого запроса, поэтому 10% на канарейке означают «примерно каждый десятый
+  запрос», а не «десять процентов пользователей».
+
+  Порядок правил в http важен: срабатывает первое правило, у которого совпал match.
+
+ШАГ 1. Смотрим, как трафик распределяется без правил Istio
+
+    k1 get virtualservice -n bookinfo
+  ЗАЧЕМ: увидеть, что правил маршрутизации приложения пока нет.
+  ВЫ УВИДИТЕ: одну строку bookinfo — это VirtualService Ingress Gateway из работы 1.1.
+
+    k1 get destinationrule -n bookinfo
+  ВЫ УВИДИТЕ: "No resources found in bookinfo namespace".
+
+    for i in $(seq 1 12); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ЗАЧЕМ: зафиксировать исходное состояние до наших правил.
+  ВЫ УВИДЕТЕ: все три версии вперемешку, например 4 reviews-v1, 4 reviews-v2,
+  4 reviews-v3. Числа каждый раз разные: работает балансировщик Kubernetes.
+
+  Блок отзывов на странице подписан строкой "Reviews served by:" — по имени пода
+  видно, какая версия ответила. Это наш индикатор на всю работу.
+
+ШАГ 2. Создаём DestinationRule с subsets
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: reviews-dr
+spec:
+  host: reviews
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_REQUEST
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+  - name: v3
+    labels:
+      version: v3
+EOF
+  ЗАЧЕМ: превратить три Deployment в три именованных адресата, на которые можно
+  ссылаться из маршрутов.
+  ВЫ УВИДЕТЕ: "destinationrule.networking.istio.io/reviews-dr created".
+
+    k1 get destinationrule reviews-dr -n bookinfo
+  ВЫ УВИДИТЕ: HOST reviews, AGE несколько секунд.
+
+  Трафик после этого шага не изменился: subset, на который не ссылается маршрут,
+  не применяется. Проверьте это тем же циклом curl, если сомневаетесь.
+
+ШАГ 3. Переводим 100% трафика reviews на v1
+
+    cat > ~/reviews-v1.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-vs
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+      weight: 100
+EOF
+    k1 apply -n bookinfo -f ~/reviews-v1.yaml
+    sleep 10
+  ЗАЧЕМ: сохранить baseline в файл — он понадобится в конце работы и в уборке 3.3.
+  Пауза нужна потому, что конфигурация доезжает до sidecar примерно за 10 с.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-vs created".
+
+    for i in $(seq 1 10); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ЗАЧЕМ: убедиться, что маршрут управляет трафиком, а не Kubernetes.
+  ВЫ УВИДЕТЕ: одну строку "10 reviews-v1". Звёзд рейтинга на странице нет:
+  reviews v1 не обращается к ratings.
+
+ШАГ 4. Канареечный выкат 90/10
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-vs
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+      weight: 90
+    - destination:
+        host: reviews
+        subset: v2
+      weight: 10
+EOF
+  ЗАЧЕМ: пустить 10% запросов на новую версию, не переключая остальных.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-vs configured".
+
+    for i in $(seq 1 40); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ЗАЧЕМ: измерить фактическое распределение.
+  ВЫ УВИДЕТЕ: около 36 reviews-v1 и около 4 reviews-v2. Точное число — случайная
+  величина; 3-6 запросов на v2 при сорока запросах — норма.
+
+ШАГ 5. Канарейка 50/50
+
+    k1 apply -n bookinfo -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-vs
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+      weight: 50
+    - destination:
+        host: reviews
+        subset: v2
+      weight: 50
+EOF
+  ЗАЧЕМ: расширить канарейку до половины трафика.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-vs configured".
+
+    for i in $(seq 1 30); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ВЫ УВИДЕТЕ: распределение близко к 15/15. У запросов на v2 в блоке отзывов
+  появляются чёрные звёзды: v2 обращается к ratings.
+
+  Посмотрите на конфигурацию маршрута глазами Envoy:
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    istioctl proxy-config route "$POD" -n bookinfo -o json | grep -A4 "reviews"
+  ВЫ УВИДЕТЕ: взвешенное дерево маршрутов, где weight 50 у двух кластеров.
+
+ШАГ 6. Возвращаем baseline 100% на v1
+
+    k1 apply -n bookinfo -f ~/reviews-v1.yaml
+  ЗАЧЕМ: объявленное состояние после работы — весь трафик на стабильной версии.
+  ВЫ УВИДЕТЕ: "virtualservice.networking.istio.io/reviews-vs configured" —
+  живой объект отличался от файла после шага 5.
+
+    for i in $(seq 1 10); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ВЫ УВИДЕТЕ: "10 reviews-v1". Канареечный выкат завершён, стенд в baseline.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Две проверки — конфигурация и фактический трафик:
+    k1 get destinationrule reviews-dr -n bookinfo
+    k1 get virtualservice reviews-vs -n bookinfo
+    for i in $(seq 1 10); do
+      curl -s "http://$INGRESS_HOST/productpage" | grep -o -m1 "reviews-v[0-9]"
+    done | sort | uniq -c
+  ВЫ УВИДЕТЕ: DR с host reviews, у reviews-vs пустое поле GATEWAYS (правило для
+  sidecar) и ровно одну строку "10 reviews-v1".
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: error: unable to recognize "STDIN": no matches for kind "DestinationRule"
+ПРИЧИНА: в apiVersion указана несуществующая группа, например networking.istio.io/v2.
+ЧТО ДЕЛАТЬ:
+  1. Проверить API: k1 api-resources | grep istio.
+  2. Использовать networking.istio.io/v1, как в шаге 2.
+
+ПРОБЛЕМА: curl: (7) Failed to connect, echo "$INGRESS_HOST" пустой
+ПРИЧИНА: нет внешнего адреса у Ingress Gateway: MetalLB не выдал IP или gateway не установлен.
+ЧТО ДЕЛАТЬ:
+  1. Проверить сервис: k1 get svc -n istio-system istio-ingressgateway.
+  2. Проверить MetalLB: k1 get pods -n metallb-system.
+  3. Перезагрузить окружение: source ~/istio-course/scripts/env.sh.
+
+ПРОБЛЕМА: веса в VirtualService заданы, но страница по-прежнему показывает все три версии
+ПРИЧИНА: маршрут не применяется: VS создан в другом namespace или host не совпадает
+с сервисом reviews в bookinfo.
+ЧТО ДЕЛАТЬ:
+  1. Проверить namespace и host: k1 get virtualservice reviews-vs -n bookinfo -o yaml.
+  2. Проверить конфигурацию mesh: istioctl analyze -n bookinfo.
+  3. Убедиться, что в выводе нет других VS с host reviews: k1 get vs -n bookinfo.
+
+ПРОБЛЕМА: 503 или "no healthy upstream" после включения маршрута на subset
+ПРИЧИНА: в subset не попал ни один под: метки version в DR не совпадают с метками подов.
+ЧТО ДЕЛАТЬ:
+  1. Сравнить метки: k1 get pod -n bookinfo --show-labels | grep reviews.
+  2. Проверить subsets в DR: k1 get destinationrule reviews-dr -n bookinfo -o yaml.
+  3. Исправить labels в DR и применить манифест заново.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Поставьте веса 99/1, прогоните 100 запросов и посчитайте, сколько ушло на v2.
+  Объясните, почему число не обязано быть равным единице, и посчитайте ожидаемый
+  разброс. Затем верните baseline командой из шага 6.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем DestinationRule отличается от VirtualService и что каждый из них меняет?
+  2. Что такое subset и по какому признаку он выбирает поды?
+  3. Почему сразу после создания DestinationRule трафик не изменился?
+  4. Как Envoy применяет веса: к соединению или к каждому запросу?
+  5. Что произойдёт, если в VirtualService указан subset, которого нет в DestinationRule?
+  6. Зачем перед канареечным выкатом переводить 100% трафика на стабильную версию?
+
+УБОРКА
+  Ничего не удаляем. Это baseline следующих работ:
+    destinationrule reviews-dr с subsets v1, v2, v3;
+    virtualservice reviews-vs со 100% на v1.
+  Убеждаемся, что стенд здоров:
+    k1 get pods -n bookinfo
+    echo "$INGRESS_HOST"
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДЕТЕ: шесть подов Ready, IP gateway и HTTP 200.
+
+ЧТО ДАЛЬШЕ
+  Мы научились раскладывать трафик по версиям и управлять весами. В работе 3.2 добавим
+  маршрутизацию по заголовку, искусственную задержку, таймауты и повторы — и увидим,
+  как Envoy ограничивает время ответа, когда зависимость тормозит.

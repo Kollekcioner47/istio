@@ -1,0 +1,356 @@
+Лабораторная работа 5.3: Egress Gateway и контроль исходящего трафика
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        5. Istio как API Gateway
+РАБОТА:        5.3
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline Istio 1.25.2 без egress gateway, bookinfo в mesh
+СОСТОЯНИЕ ПОСЛЕ: egress gateway и объекты egress удалены, baseline не изменён
+СЛЕДУЮЩАЯ:     lab-6.1_multicluster.txt
+
+ЦЕЛИ РАБОТЫ
+  - Поднять egress gateway через Helm и убедиться, что он в mesh.
+  - Пропустить трафик к внешнему сервису через egress gateway по маршруту
+    mesh -> gateway -> внешний сервис.
+  - Включить TLS origination SIMPLE и доказать по логу gateway, что наружу уходит
+    HTTPS.
+  - Разрешить egress только одному service account политикой авторизации.
+
+ЧТО МЫ СДЕЛАЕМ
+  Поставим отдельный egress gateway, опишем внешний сервис через ServiceEntry и
+  направим к нему трафик из mesh через gateway. Затем включим TLS origination и
+  ограничим доступ политикой по service account. В конце всё уберём.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, окружение из ~/istio-course/scripts/env.sh.
+  - cluster-1 с baseline: istiod, istio-ingressgateway, bookinfo; Helm с repo istio.
+  - Интернет с узлов: github.com отвечает 301 по HTTP (иначе замените хост на example.com).
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем Istio, Helm и отсутствие egress gateway:
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: istiod и istio-ingressgateway в 1/1 Running.
+
+    k1 get pods -n istio-system -l istio=egressgateway
+    helm repo list | grep istio
+  ВЫ УВИДИТЕ: No resources found и repo istio в списке.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Egress gateway — симметричная ingress gateway точка на выходе из mesh: отдельный
+  под Envoy для исходящего трафика, маршрутизации, TLS и политик. Внешний сервис
+  сначала описывается ServiceEntry: только после этого Istio знает его как сервис.
+
+  Маршрут — это Gateway с селектором istio: egressgateway, VirtualService из двух
+  веток (mesh -> gateway, gateway -> внешний хост) и DestinationRule на сервис gateway.
+  ServiceEntry обязан иметь resolution: DNS, иначе gateway зациклится сам на себя.
+
+  TLS origination: приложение отправляет HTTP, а TLS до внешнего сайта ставит gateway.
+  Сервер gateway на порту 80 переключается на protocol: HTTPS с tls.mode: ISTIO_MUTUAL,
+  а DestinationRule на внешний хост задаёт tls.mode: SIMPLE на порту 443 и создаётся
+  в istio-system — только оттуда gateway его видит.
+
+  AuthorizationPolicy на подах egress gateway ограничивает, кому можно выходить:
+  правило проверяет principals — SPIFFE-id источника.
+
+ШАГ 1. Ставим egress gateway через Helm
+
+    helm install istio-egressgateway istio/gateway -n istio-system --version 1.25.2 \
+      --skip-schema-validation \
+      --set name=istio-egressgateway --set revision=1-25 --wait
+  ЗАЧЕМ: чарт istio/gateway с name создаёт сервис и деплой istio-egressgateway в
+  ревизии 1-25; метка istio=egressgateway появится автоматически.
+  ВЫ УВИДИТЕ: NAME: istio-egressgateway, STATUS: deployed, Installation complete.
+  ПРОВЕРИТЬ НА СТЕНДЕ: в docs 1.25 egress ставится istioctl; чарт проверен по исходникам.
+
+    k1 get pods -n istio-system -l istio=egressgateway
+    k1 get svc -n istio-system istio-egressgateway
+  ВЫ УВИДИТЕ: под istio-egressgateway-... 1/1 Running, сервис типа LoadBalancer.
+
+    source ~/istio-course/scripts/env.sh
+
+ШАГ 2. Готовим namespace httpbin и клиентский под с curl
+
+    k1 create namespace httpbin
+    k1 label namespace httpbin istio.io/rev=1-25
+
+    k1 apply -f ~/istio-1.25.2/samples/curl/curl.yaml -n httpbin
+    sleep 3
+    k1 wait --for=condition=Ready pods -l app=curl -n httpbin --timeout=120s
+  ЗАЧЕМ: под создаётся асинхронно; без паузы wait может не найти его и упасть.
+
+    POD=$(k1 get pod -n httpbin -l app=curl -o jsonpath='{.items[0].metadata.name}')
+    k1 get pods -n httpbin
+  ВЫ УВИДИТЕ: curl-... 2/2 Running — контейнер curl и istio-proxy.
+
+ШАГ 3. Смотрим, что до настройки трафик уходит напрямую
+
+    k1 exec -n httpbin "$POD" -c curl -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+  ЗАЧЕМ: без ServiceEntry и маршрутов исходящий трафик не контролируется (ALLOW_ANY).
+  ВЫ УВИДИТЕ: 301 — GitHub отвечает редиректом на HTTPS.
+
+ШАГ 4. Описываем внешний сервис через ServiceEntry
+
+    k1 apply -n httpbin -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata: {name: github-com, namespace: httpbin}
+spec:
+  hosts: [github.com]
+  ports:
+  - {number: 80, name: http, protocol: HTTP}
+  - {number: 443, name: https, protocol: HTTPS}
+  resolution: DNS
+EOF
+  ЗАЧЕМ: теперь github.com — сервис в реестре Istio, его видно в proxy-config.
+  ВЫ УВИДИТЕ: serviceentry.networking.istio.io/github-com created.
+
+ШАГ 5. Направляем трафик через egress gateway
+
+    k1 apply -n httpbin -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: istio-egressgateway, namespace: httpbin}
+spec:
+  selector: {istio: egressgateway}
+  servers:
+  - port: {number: 80, name: http, protocol: HTTP}
+    hosts: [github.com]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: egressgateway-for-github, namespace: httpbin}
+spec:
+  host: istio-egressgateway.istio-system.svc.cluster.local
+  subsets:
+  - name: github
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: direct-github-through-egress-gateway, namespace: httpbin}
+spec:
+  hosts: [github.com]
+  gateways: [istio-egressgateway, mesh]
+  http:
+  - match: [{gateways: [mesh], port: 80}]
+    route:
+    - destination: {host: istio-egressgateway.istio-system.svc.cluster.local,
+        subset: github, port: {number: 80}}
+  - match: [{gateways: [istio-egressgateway], port: 80}]
+    route:
+    - destination: {host: github.com, port: {number: 80}}
+EOF
+  ЗАЧЕМ: две ветки маршрута: sidecar отправляет в gateway, gateway — во внешний хост.
+  ВЫ УВИДИТЕ: gateway, destinationrule и virtualservice created.
+
+    sleep 10
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+    k1 exec -n httpbin "$POD" -c curl -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+  ВЫ УВИДИТЕ: 301 — ответ тот же, изменился путь.
+
+    k1 logs -n istio-system -l istio=egressgateway -c istio-proxy --tail=3
+  ВЫ УВИДИТЕ: JSON-строку с "response_code":301 и
+  "upstream_cluster":"outbound|80||github.com" — трафик действительно прошёл
+  через egress gateway (access-логи включены в JSON в работе 2.1).
+
+ШАГ 6. Включаем TLS origination на egress gateway
+
+    k1 apply -n httpbin -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: istio-egressgateway, namespace: httpbin}
+spec:
+  selector: {istio: egressgateway}
+  servers:
+  - port: {number: 80, name: https-port-for-tls-origination, protocol: HTTPS}
+    hosts: [github.com]
+    tls: {mode: ISTIO_MUTUAL}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: egressgateway-for-github, namespace: httpbin}
+spec:
+  host: istio-egressgateway.istio-system.svc.cluster.local
+  subsets:
+  - name: github
+    trafficPolicy:
+      portLevelSettings:
+      - port: {number: 80}
+        tls: {mode: ISTIO_MUTUAL, sni: github.com}
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: direct-github-through-egress-gateway, namespace: httpbin}
+spec:
+  hosts: [github.com]
+  gateways: [istio-egressgateway, mesh]
+  http:
+  - match: [{gateways: [mesh], port: 80}]
+    route:
+    - destination: {host: istio-egressgateway.istio-system.svc.cluster.local,
+        subset: github, port: {number: 80}}
+  - match: [{gateways: [istio-egressgateway], port: 80}]
+    route:
+    - destination: {host: github.com, port: {number: 443}}
+EOF
+  ЗАЧЕМ: до gateway идёт mTLS, а из gateway во внешний сайт — HTTPS от порта 443.
+  ВЫ УВИДИТЕ: объекты обновлены (configured).
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: originate-tls-for-github, namespace: istio-system}
+spec:
+  host: github.com
+  trafficPolicy:
+    portLevelSettings:
+    - port: {number: 443}
+      tls: {mode: SIMPLE}
+EOF
+  ЗАЧЕМ: TLS origination для внешнего хоста; DR кладём в istio-system, чтобы его
+  подхватил сам egress gateway.
+  ВЫ УВИДИТЕ: destinationrule.networking.istio.io/originate-tls-for-github created.
+
+    sleep 10
+
+    k1 exec -n httpbin "$POD" -c curl -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+  ВЫ УВИДИТЕ: 200 вместо 301 — редирект больше не нужен, gateway сам поднял HTTPS.
+
+    k1 logs -n istio-system -l istio=egressgateway -c istio-proxy --tail=3
+  ВЫ УВИДИТЕ: JSON-строку с "response_code":200 и
+  "upstream_cluster":"outbound|443||github.com".
+
+ШАГ 7. Ограничиваем egress gateway одним service account
+
+    k1 apply -f - <<'EOF'
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: egress-gateway-allow-curl, namespace: istio-system}
+spec:
+  selector: {matchLabels: {istio: egressgateway}}
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: [cluster.local/ns/httpbin/sa/curl]
+EOF
+  ЗАЧЕМ: разрешаем вход на gateway только клиентам с identity httpbin/curl.
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io/egress-gateway-allow-curl created.
+
+    k1 exec -n httpbin "$POD" -c curl -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+  ВЫ УВИДИТЕ: 200 — разрешённый service account проходит.
+
+  Проверяем запрет: поднимаем клиент с другим ServiceAccount в том же namespace.
+  Другой namespace здесь не подходит: ServiceEntry и VirtualService созданы в
+  httpbin, и клиент из httpbin-other получил бы не 403, а 503 (нет маршрута).
+    k1 run other-client -n httpbin --image=curlimages/curl:8.10.1 \
+      --restart=Never -- sleep 3600
+    k1 wait --for=condition=Ready pod/other-client -n httpbin --timeout=180s
+    k1 exec -n httpbin other-client -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+  ВЫ УВИДИТЕ: 403 — principal cluster.local/ns/httpbin/sa/default не разрешён.
+
+ШАГ 8. Сужаем видимость сервисов через Sidecar
+
+    istioctl proxy-config clusters "$POD" -n httpbin | wc -l
+  ВЫ УВИДИТЕ: число кластеров, которое видит sidecar клиента (десятки).
+
+    k1 apply -n httpbin -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata: {name: curl-egress-scope, namespace: httpbin}
+spec:
+  workloadSelector: {labels: {app: curl}}
+  egress:
+  - hosts: ["./*", "istio-system/*"]
+EOF
+  ЗАЧЕМ: sidecar scoped-режим оставляет только сервисы своего namespace и
+  istio-system, где живёт egress gateway.
+  ВЫ УВИДИТЕ: sidecar.networking.istio.io/curl-egress-scope created.
+    sleep 5
+
+    istioctl proxy-config clusters "$POD" -n httpbin | wc -l
+  ВЫ УВИДИТЕ: число заметно меньше. На стенде курса /clusters — это тысячи
+  строк, поэтому сравнивайте относительное уменьшение, а не абсолютные 30/8.
+
+    k1 exec -n httpbin "$POD" -c curl -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+  ВЫ УВИДИТЕ: 200 — egress продолжает работать: istio-system/* оставляет видимым
+  egress gateway, а ServiceEntry лежит в своём namespace.
+  ПОМНИТЕ: Sidecar сужает конфигурацию, а не блокирует трафик; запрет даёт
+  AuthorizationPolicy на gateway. Чужой namespace добавляйте в egress.hosts явно.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+    k1 exec -n httpbin "$POD" -c curl -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://github.com
+    k1 logs -n istio-system -l istio=egressgateway -c istio-proxy --tail=2
+  ВЫ УВИДИТЕ: 200 и строку с outbound|443||github.com.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: запрос через egress gateway возвращает 503 или таймаут.
+ПРИЧИНА: у ServiceEntry стоит resolution: NONE или STATIC, либо он создан в другом
+namespace и не виден клиенту, либо маршрут в VirtualService ведёт не в subset github.
+ЧТО ДЕЛАТЬ:
+  1. Проверить ServiceEntry: k1 get serviceentry -n httpbin -o yaml | grep resolution.
+  2. Проверить, что DestinationRule и VirtualService в том же namespace, что ServiceEntry.
+  3. Проверить, что Gateway вошёл в mesh: k1 get pods -n istio-system -l istio=egressgateway.
+
+ПРОБЛЕМА: после TLS origination остаётся 301, наружу уходит HTTP.
+ПРИЧИНА: DestinationRule на внешний хост создан не в istio-system (gateway его не
+видит), либо в VirtualService не заменён порт назначения на 443.
+ЧТО ДЕЛАТЬ:
+  1. Проверить DR: k1 get destinationrule originate-tls-for-github -n istio-system.
+  2. Проверить порт в маршруте gateway: k1 get virtualservice direct-github-through-egress-gateway
+     -n httpbin -o yaml | grep -A2 destination.
+  3. Посмотреть лог gateway: k1 logs -n istio-system -l istio=egressgateway
+     -c istio-proxy --tail=5 — там виден outbound|443||github.com.
+
+ПРОБЛЕМА: разрешённый клиент получает 403 после AuthorizationPolicy.
+ПРИЧИНА: principal не совпал: в политике неверный namespace или имя service account,
+либо под клиента работает под другим SA.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть SA пода: k1 get pod "$POD" -n httpbin -o jsonpath='{.spec.serviceAccountName}'.
+  2. Сверить строку principals с SPIFFE-id: cluster.local/ns/httpbin/sa/curl.
+  3. Убедиться, что политика в istio-system и селектор istio: egressgateway.
+
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Пропустите через тот же egress gateway второй внешний хост example.com. Измените
+  hosts в Gateway на ["*"] и добавьте второй subset в DestinationRule, отдельный
+  ServiceEntry и новую ветку в VirtualService. Политика по service account должна
+  разрешать только curl из httpbin.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Зачем нужен ServiceEntry, если внешний сервис доступен из пода напрямую?
+  2. Почему ServiceEntry для egress gateway обязан иметь resolution: DNS?
+  3. Почему DestinationRule для TLS origination создан в istio-system, а не в httpbin?
+  4. Что проверяет AuthorizationPolicy на egress gateway и почему недостаточно Sidecar?
+
+УБОРКА
+  Удаляем egress gateway и созданные объекты:
+    helm uninstall istio-egressgateway -n istio-system
+    k1 delete destinationrule originate-tls-for-github -n istio-system
+    k1 delete authorizationpolicy egress-gateway-allow-curl -n istio-system
+    k1 delete namespace httpbin
+    k1 delete pod -n istio-system -l istio=egressgateway --ignore-not-found
+
+  Проверяем, что baseline вернулся:
+    k1 get pods -n istio-system
+    k1 get pods -n istio-system -l istio=egressgateway
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: istiod и istio-ingressgateway в Running, egress gateway отсутствует, 200.
+
+ЧТО ДАЛЬШЕ
+  Мы научились контролировать исходящий трафик и шифровать его без изменений в
+  приложении. В работе 6.1 объединим два кластера в один mesh и посмотрим, как трафик
+  ходит между кластерами через east-west gateway.

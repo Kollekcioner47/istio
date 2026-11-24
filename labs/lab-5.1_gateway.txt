@@ -1,0 +1,357 @@
+Лабораторная работа 5.1: Ingress Gateway, CORS и JWT-аутентификация
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        5. Istio как API Gateway
+РАБОТА:        5.1
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline Istio 1.25.2: istiod и ingress gateway, bookinfo в mesh
+СОСТОЯНИЕ ПОСЛЕ: namespace httpbin удалён, политики JWT в istio-system удалены
+СЛЕДУЮЩАЯ:     lab-5.2_ratelimit.txt
+
+ЦЕЛИ РАБОТЫ
+  - Опубликовать httpbin через собственный Gateway и VirtualService.
+  - Настроить CORS и проверить preflight так, как его отправляет браузер.
+  - Закрыть API JWT и на одном URL получить 401, 403 и 200.
+
+ЧТО МЫ СДЕЛАЕМ
+  Поднимем в namespace httpbin учебный сервис, откроем его через Ingress Gateway
+  по пути /api, добавим CORS. Затем включим JWT и закроем анонимный доступ.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, окружение из ~/istio-course/scripts/env.sh.
+  - cluster-1 с baseline: istiod, istio-ingressgateway, bookinfo в mesh, MetalLB.
+  - Интернет на admin и на узлах: istiod скачивает JWKS, admin — demo.jwt.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем компоненты Istio и адрес gateway:
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: istiod-... и istio-ingressgateway-... в статусе 1/1 Running.
+
+    echo "$INGRESS_HOST"
+  ВЫ УВИДИТЕ: IP из пула MetalLB, например 192.168.56.240.
+
+  Проверяем метку, по которой будем выбирать под gateway:
+    k1 get pods -n istio-system -l istio=ingressgateway
+  ВЫ УВИДИТЕ: один под istio-ingressgateway-... в статусе Running.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200 — bookinfo и gateway работают.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Gateway — конфигурация уже работающего пода Ingress Gateway: порты, протоколы,
+  хосты. Селектор выбирает поды по метке, а не создаёт балансировщик. VirtualService
+  привязывается к Gateway полем gateways и описывает match (путь, заголовки, метод) и
+  route в сервис. Без VirtualService запрос без маршрута получает от Envoy 404.
+
+  CORS — политика в маршруте VirtualService (corsPolicy). Envoy сам отвечает на
+  preflight OPTIONS, если origin клиента попал в allowOrigins, и добавляет заголовки
+  Access-Control-Allow-Origin, Allow-Methods, Max-Age. Запрос с чужим origin проходит,
+  но без этих заголовков, и браузер его отбрасывает.
+
+  RequestAuthentication проверяет подпись и издателя предъявленного токена: битый
+  токен получает 401, а отсутствие токена проверка не запрещает. AuthorizationPolicy
+  решает, кому можно: requestPrincipals ["*"] — любой валидный JWT. Без токена
+  principal нет — политика отвечает 403. Итого: 401 — токен невалиден, 403 — его нет.
+
+ШАГ 1. Создаём namespace httpbin и разворачиваем приложение
+
+    k1 create namespace httpbin
+
+    k1 label namespace httpbin istio.io/rev=1-25
+  ЗАЧЕМ: метка ревизии включает автоматическую инъекцию sidecar для новых подов.
+  ВЫ УВИДИТЕ: namespace/httpbin labeled.
+
+    k1 apply -f ~/istio-1.25.2/samples/httpbin/httpbin.yaml -n httpbin
+  ЗАЧЕМ: httpbin — учебный HTTP-сервис: отдаёт заголовки, статусы и задержки.
+  ВЫ УВИДИТЕ: serviceaccount, service и deployment.apps/httpbin созданы.
+
+    k1 wait --for=condition=Ready pods --all -n httpbin --timeout=120s
+
+    k1 get pods -n httpbin
+  ВЫ УВИДИТЕ: httpbin-... 2/2 Running — приложение и istio-proxy.
+
+ШАГ 2. Открываем httpbin через собственный Gateway
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: httpbin-gateway
+  namespace: httpbin
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+EOF
+  ЗАЧЕМ: Gateway добавляет сервер на порт 80 уже работающего Ingress Gateway.
+  ВЫ УВИДИТЕ: gateway.networking.istio.io/httpbin-gateway created.
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: httpbin-vs
+  namespace: httpbin
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - httpbin-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /api/
+    rewrite:
+      uri: /
+    route:
+    - destination:
+        host: httpbin.httpbin.svc.cluster.local
+        port:
+          number: 8000
+EOF
+  ЗАЧЕМ: маршрут публикует только префикс /api, остальные пути не объявлены.
+  ВЫ УВИДИТЕ: virtualservice.networking.istio.io/httpbin-vs created.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 200 — запрос прошёл: клиент, gateway, httpbin.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/get"
+  ВЫ УВИДИТЕ: 404 — Envoy не нашёл маршрут для этого пути.
+
+ШАГ 3. Включаем CORS и проверяем preflight
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: httpbin-vs
+  namespace: httpbin
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - httpbin-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /api/
+    rewrite:
+      uri: /
+    corsPolicy:
+      allowOrigins:
+      - exact: https://myfrontend.example.com
+      allowMethods:
+      - GET
+      - POST
+      allowHeaders:
+      - authorization
+      - content-type
+      exposeHeaders:
+      - x-request-id
+      maxAge: "24h"
+      allowCredentials: false
+    route:
+    - destination:
+        host: httpbin.httpbin.svc.cluster.local
+        port:
+          number: 8000
+EOF
+  ЗАЧЕМ: CORS-политика привязывается к тому же маршруту, где стоит route.
+  ВЫ УВИДИТЕ: virtualservice.networking.istio.io/httpbin-vs configured.
+
+    curl -s -o /dev/null -D - -X OPTIONS \
+      -H "Origin: https://myfrontend.example.com" \
+      -H "Access-Control-Request-Method: GET" \
+      "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: HTTP/1.1 200 OK, access-control-allow-origin:
+  https://myfrontend.example.com, allow-methods: GET,POST, max-age: 86400.
+
+    curl -s -o /dev/null -D - -X OPTIONS \
+      -H "Origin: https://evil.example.com" \
+      -H "Access-Control-Request-Method: GET" \
+      "http://$INGRESS_HOST/api/get" | grep -ci "access-control-max-age: 86400"
+  ВЫ УВИДИТЕ: 0 — политика Istio не добавила CORS-заголовки для чужого origin.
+  httpbin сам отдаёт access-control-allow-origin, поэтому проверяем именно
+  max-age, который выставляет Istio (86400), а не приложение (3600).
+
+ШАГ 4. Включаем проверку JWT
+
+  Скачиваем тестовый токен из репозитория Istio нужной версии:
+    TOKEN=$(curl -s \
+      https://raw.githubusercontent.com/istio/istio/1.25.2/security/tools/jwt/samples/demo.jwt)
+
+    echo "$TOKEN" | cut -d '.' -f2 - | base64 -d
+  ВЫ УВИДИТЕ: JSON с iss и sub testing@secure.istio.io и claim "foo":"bar".
+  Токен подписан ключом, который лежит рядом в jwks.json.
+
+    k1 apply -f - <<'EOF'
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: jwt-gateway
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      istio: ingressgateway
+  jwtRules:
+  - issuer: testing@secure.istio.io
+    jwksUri: "https://raw.githubusercontent.com/istio/istio/1.25.2\
+      /security/tools/jwt/samples/jwks.json"
+EOF
+  ЗАЧЕМ: политика вешается на под gateway (namespace istio-system, метка istio).
+  ВЫ УВИДИТЕ: requestauthentication.security.istio.io/jwt-gateway created.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 200 — токена нет, проверять нечего, авторизация не включена.
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H "Authorization: Bearer invalid-token" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 401 — RequestAuthentication отклонил невалидный токен.
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H "Authorization: Bearer $TOKEN" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 200 — токен валиден.
+
+ШАГ 5. Закрываем API политикой авторизации
+
+    k1 apply -f - <<'EOF'
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: httpbin-require-jwt
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      istio: ingressgateway
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/*"]
+EOF
+  ЗАЧЕМ: правило разрешает только запросы с валидным JWT, остальное запрещено.
+  ВЫ УВИДИТЕ: authorizationpolicy.security.istio.io/httpbin-require-jwt created.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 403 — токена нет, principal отсутствует, правило не сработало.
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H "Authorization: Bearer invalid-token" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 401 — до авторизации дело не дошло: токен отклонён.
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H "Authorization: Bearer $TOKEN" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 200 — валидный JWT, метод GET и путь /api/* разрешены.
+
+ШАГ 6. Смотрим, как конфигурация дошла до gateway
+
+    GW=$(k1 get pod -n istio-system -l istio=ingressgateway \
+      -o jsonpath='{.items[0].metadata.name}')
+
+    istioctl proxy-config route "$GW" -n istio-system | grep -i httpbin
+  ЗАЧЕМ: убедиться, что маршрут /api собран в конфигурации Envoy.
+  ВЫ УВИДИТЕ: строку с доменом *:80 и маршрутом /api.
+
+    istioctl analyze -n httpbin
+  ЗАЧЕМ: штатная проверка конфигурации на противоречия.
+  ВЫ УВИДИТЕ: сообщение No validation issues found. Флаг -n указывается один раз:
+  с двумя -n анализатор добавит info/warning по аддонам istio-system.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/api/get"
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H "Authorization: Bearer invalid-token" "http://$INGRESS_HOST/api/get"
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H "Authorization: Bearer $TOKEN" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 403, 401 и 200 соответственно.
+
+    k1 get gateway,virtualservice -n httpbin
+  ВЫ УВИДИТЕ: httpbin-gateway и httpbin-vs в списке.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: на /api/get приходит 404, хотя VirtualService создан.
+ПРИЧИНА: Gateway не выбран подом gateway, либо VirtualService ссылается на Gateway
+из другого namespace, либо маршрут объявлен с другим префиксом.
+ЧТО ДЕЛАТЬ:
+  1. Проверить метки пода: k1 get pods -n istio-system --show-labels.
+  2. Сверить namespace: k1 get gateway,virtualservice -n httpbin -o wide.
+  3. Разобрать маршруты: istioctl analyze -n httpbin.
+
+ПРОБЛЕМА: preflight отвечает 200, но заголовков access-control-* нет.
+ПРИЧИНА: corsPolicy стоит не на том маршруте, origin не совпал с allowOrigins
+или запрос отправлен не как OPTIONS с Access-Control-Request-Method.
+ЧТО ДЕЛАТЬ:
+  1. Смотреть полный ответ: curl -D - -X OPTIONS -H "Origin: ..." и сверить origin
+     и method с конфигурацией VirtualService.
+  2. Проверить, что corsPolicy лежит в том же элементе http, что и route.
+
+ПРОБЛЕМА: все запросы 200, невалидный токен не даёт 401.
+ПРИЧИНА: RequestAuthentication не применился: не та метка селектора, не тот
+namespace, либо istiod не смог скачать jwks.json (нет интернета на узлах).
+ЧТО ДЕЛАТЬ:
+  1. Проверить, что политика в istio-system: k1 get requestauthentication -A.
+  2. Посмотреть логи istiod: k1 logs -n istio-system deploy/istiod | grep -i jwks.
+  3. Проверить доступность jwksUri: curl -sI "<jwksUri>" | head -1.
+
+ПРОБЛЕМА: валидный токен даёт 403.
+ПРИЧИНА: заголовок не доходит до Envoy, токен просрочен или политика требует
+другой principal (requestPrincipals задан точным значением, а не "*").
+ЧТО ДЕЛАТЬ:
+  1. Отправить запрос с -D - и проверить, что заголовок Authorization уходит.
+  2. Декодировать payload токена и проверить iss, sub и exp.
+  3. Сверить requestPrincipals в AuthorizationPolicy с iss/sub токена.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  В demo.jwt есть claim "foo":"bar". Дополните AuthorizationPolicy условием when,
+  которое требует этот claim:
+    when:
+    - key: request.auth.claims[foo]
+      values: ["bar"]
+  Убедитесь, что demo.jwt проходит, а groups-scope.jwt из того же каталога
+  репозитория Istio (в нём нет foo) получает 403.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Зачем Gateway и VirtualService разделены на два объекта?
+  2. Почему запрос без токена получает 403, а с битым токеном 401?
+  3. Что произойдёт, если из VirtualService убрать gateways: [httpbin-gateway]?
+  4. Почему corsPolicy привязана к маршруту, а не к Gateway?
+  5. Что проверяет RequestAuthentication и что проверяет AuthorizationPolicy?
+
+УБОРКА
+  Удаляем namespace приложения и политики, созданные в istio-system:
+    k1 delete namespace httpbin
+    k1 delete requestauthentication jwt-gateway -n istio-system
+    k1 delete authorizationpolicy httpbin-require-jwt -n istio-system
+
+  Убеждаемся, что baseline вернулся:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: istiod и istio-ingressgateway в Running, bookinfo на месте, 200.
+  Gateway и VirtualService удалились вместе с namespace httpbin.
+
+ЧТО ДАЛЬШЕ
+  Мы научились публиковать сервис, настраивать CORS и закрывать API JWT. В работе 5.2
+  ограничим частоту запросов: сначала локально в Envoy, затем глобально через Redis и
+  сервис ratelimit, и добавим свой заголовок Lua-фильтром.

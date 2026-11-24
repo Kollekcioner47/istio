@@ -1,0 +1,360 @@
+Лабораторная работа 8.1: Управляемые инциденты и пост-мортем
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        8. Troubleshooting и инциденты
+РАБОТА:        8.1
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     medium
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline: Istio Helm-ревизия 1-25, bookinfo 2/2, аддоны 2.1 стоят
+СОСТОЯНИЕ ПОСЛЕ: инциденты откачены, mesh в baseline, 4 пост-мортема в ~/incidents
+СЛЕДУЮЩАЯ:     lab-8.2_incident_blind.txt
+
+ЦЕЛИ РАБОТЫ
+  - Пройти маршрут диагностики четырёх инцидентов: симптом, слой, объект, причина.
+  - Отличить отказ data plane от отказа control plane и от ошибки уже розданной конфигурации.
+  - Восстанавливать mesh штатными средствами и оформлять пост-мортем по одной структуре.
+
+ЧТО МЫ СДЕЛАЕМ
+  Вы дежурный инженер. Преподаватель по одному включает четыре инцидента скриптом; вы каждый
+  раз фиксируете симптом, проходите маршрут диагностики, называете причину, восстанавливаете
+  сервис, подтверждаете восстановление и в конце оформляете четыре пост-мортема.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, кластер cluster-1 в состоянии Ready.
+  - Стенд после работы 7.1: Istio baseline, bookinfo в namespace bookinfo с sidecar.
+  - Аддоны наблюдаемости из работы 2.1 — для перекрёстной проверки в Kiali.
+  - Скрипт ~/istio-course/incidents/simulate-8.1.sh и шаблон пост-мортема. Интернет не нужен.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем, что стенд в baseline:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: istiod-1-25 1/1, аддоны Running, bookinfo 2/2, HTTP 200.
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --list
+  ВЫ УВИДИТЕ: четыре инцидента: ca-rotation, strict-no-sidecar, oom-istio-proxy, istiod-down.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Любой отказ в mesh'е относится к одному из четырёх слоёв, и слой задаёт маршрут диагностики.
+  1. Конфигурация роздана и верна, но ломается соединение: сертификаты, режим mTLS, память Envoy.
+     Control plane здоров, proxy-status показывает SYNC.
+  2. Control plane недоступен: прокси живут на последней конфигурации, но новые поды не создаются,
+     потому что webhook инъекции ходит в istiod.
+  3. Конфигурация неверна или отказывает Kubernetes: прокси в SYNC, потому что приняли именно
+     то, что им прислали (VirtualService, DestinationRule, AuthorizationPolicy, EnvoyFilter).
+  4. Отказ приложения: под не готов, у сервиса нет эндпоинтов, не хватает ресурсов.
+
+  Порядок один: симптом у клиента → граница (какой вызов ломается) → слой (proxy-status, логи)
+  → объект (конфигурация, сертификаты, ресурсы) → причина.
+
+  Три факта, на которых держатся инциденты. istiod держит самоподписанный корневой CA в секрете
+  istio-ca-secret: если секрет потерян, создаётся новый CA, и сертификаты старого перестают
+  приниматься. При mTLS-режиме STRICT прокси отклоняет незашифрованный трафик, поэтому под
+  без sidecar не может вызвать ни один сервис. У sidecar есть лимит памяти; если он ниже
+  потребления Envoy, контейнер убивают по OOM и под уходит в CrashLoopBackOff.
+
+ШАГ 1. Готовим каталог и снимаем опорные значения
+
+    mkdir -p ~/incidents
+    touch ~/incidents/8.1-notes.md
+    k1 get pods -n bookinfo
+    k1 get secret -n istio-system istio-ca-secret \
+      -o jsonpath='{.metadata.creationTimestamp}{"\n"}'
+  ЗАЧЕМ: наблюдения складываем в один файл; AGE подов и время создания CA понадобятся в инциденте 1.
+  ВЫ УВИДИТЕ: у reviews и остальных AGE больше, чем у productpage;
+  время создания CA вида 2026-11-07T18:20:11Z. Запишите оба значения в заметки.
+
+ШАГ 2. Инцидент 1: ротация CA — включаем и локализуем симптом
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --apply --incident 1
+  ЗАЧЕМ: скрипт удаляет istio-ca-secret, перезапускает istiod (появляется новый CA) и
+  перезапускает только productpage. Остальные поды остаются на сертификатах старого CA.
+  ВЫ УВИДИТЕ: "incident 1 applied" и пересоздание пода productpage.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: понять, что видит пользователь.
+  ВЫ УВИДИТЕ: 503: ingress gateway не перезапущен после смены CA и держит старый root CA,
+  поэтому не проходит mTLS к обновлённому productpage. Пользователь видит 503.
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$POD" -c istio-proxy -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://reviews:9080/reviews/1
+  ЗАЧЕМ: найти границу: страница отдаётся, а вызов productpage → reviews ломается.
+  ВЫ УВИДИТЕ: 000 (curl exit code 56 — reset соединения): TLS-рукопожатие рвётся до
+  HTTP-ответа, в логе istio-proxy — "certificate signed by unknown authority".
+
+    istioctl proxy-status
+    k1 get pods -n bookinfo
+  ЗАЧЕМ: проверить control plane и возраст подов одним взглядом.
+  ВЫ УВИДИТЕ: все прокси в статусе SYNC (конфигурация роздана);
+  productpage свежий, остальные поды старые.
+
+    k1 logs -n bookinfo "$POD" -c istio-proxy --tail=40 | grep -i "tls\|certificate"
+    R_POD=$(k1 get pod -n bookinfo -l app=reviews -o jsonpath='{.items[0].metadata.name}')
+    k1 logs -n bookinfo "$R_POD" -c istio-proxy --tail=40 | grep -i "tls\|certificate"
+  ЗАЧЕМ: увидеть отказ рукопожатия с обеих сторон — так подтверждается рассинхрон mTLS.
+  ВЫ УВИДИТЕ: "TLS error" с упоминанием сертификата или "unknown ca"; на сервере — отказ
+  принять сертификат, подписанный неизвестным ему CA.
+
+    k1 get secret -n istio-system istio-ca-secret \
+      -o jsonpath='{.metadata.creationTimestamp}{"\n"}'
+    istioctl proxy-config secret "$POD"
+  ЗАЧЕМ: первая команда показывает, что CA пересоздан; вторая — что сертификат у пода есть
+  и не истёк, значит дело не в сроке действия.
+  ВЫ УВИДИТЕ: время создания CA новее, чем AGE подов reviews; VALID CERT true, NOT AFTER в будущем.
+
+  Запишите в заметки три факта. Причина: CA пересоздан, часть подов осталась на старом CA.
+
+ШАГ 3. Инцидент 1: восстанавливаем и проверяем
+
+    k1 rollout restart deployment -n istio-system istio-ingressgateway
+    k1 rollout status deployment -n istio-system istio-ingressgateway --timeout=180s
+    k1 rollout restart deployment -n bookinfo
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: перезапуск перевыпускает сертификаты всем подам от текущего CA; gateway тоже
+  нужно перезапустить — он держит собственный сертификат и без этого остаётся на старом CA.
+  ВЫ УВИДИТЕ: поды пересоздаются и переходят в 2/2 Running.
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$POD" -c istio-proxy -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://reviews:9080/reviews/1
+  ЗАЧЕМ: проверить ту же границу, которая ломалась.
+  ВЫ УВИДИТЕ: 200.
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --revert --incident 1
+  ЗАЧЕМ: подтвердить, что инцидент снят, и подчистить возможные остатки.
+  ВЫ УВИДИТЕ: "incident 1 reverted".
+
+ШАГ 4. Инцидент 2: STRICT и под без sidecar — включаем и локализуем симптом
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --apply --incident 2
+  ЗАЧЕМ: скрипт включает mesh-wide mTLS STRICT и создаёт в bookinfo под legacy-client без
+  sidecar — так выглядит сервис, который забыли подключить к mesh.
+  ВЫ УВИДИТЕ: PeerAuthentication default в istio-system и под legacy-client с READY 1/1.
+
+    LEGACY=$(k1 get pod -n bookinfo -l app=legacy-client -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$LEGACY" -- wget -q -O- http://reviews:9080/reviews/1
+  ЗАЧЕМ: воспроизвести жалобу: задание, которое раньше работало, теперь получает отказ.
+  ВЫ УВИДИТЕ: сообщение busybox wget о сбросе соединения (connection reset by peer):
+  STRICT отклоняет plaintext до HTTP-ответа, поэтому это не HTTP 503, а reset.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: отделить проблему клиента от проблемы пользователей.
+  ВЫ УВИДИТЕ: 200 — пользовательский трафик цел.
+
+    k1 get pods -n bookinfo
+    k1 get peerauthentication --all-namespaces
+  ЗАЧЕМ: увидеть отличие этого клиента от остальных подов и режим mTLS в mesh'е.
+  ВЫ УВИДИТЕ: у legacy-client READY 1/1 (нет istio-proxy), у остальных 2/2; PeerAuthentication
+  default в istio-system с mode STRICT.
+
+    R_POD=$(k1 get pod -n bookinfo -l app=reviews -o jsonpath='{.items[0].metadata.name}')
+    k1 logs -n bookinfo "$R_POD" -c istio-proxy --tail=40 | grep -i "tls\|plaintext"
+    k1 run -n bookinfo mesh-client --image=busybox:1.36 --restart=Never --command -- sleep 3600
+    k1 wait --for=condition=Ready pod -n bookinfo mesh-client --timeout=120s
+    k1 exec -n bookinfo mesh-client -- wget -qO- --timeout=5 http://reviews:9080/reviews/1 | head -5
+  ЗАЧЕМ: лог сервера подтверждает отказ по mTLS. Контрольный клиент — отдельный под в mesh
+  (2/2), его трафик перехватывается sidecar. Exec внутрь istio-proxy не перехватывается
+  и даже в норме даёт 000, поэтому как контроль он не годится.
+  ВЫ УВИДИТЕ: ошибку рукопожатия в логе reviews и HTML-ответ 200 от reviews из mesh-client.
+
+  Запишите в заметки: из mesh-client 200, из пода без sidecar — reset соединения (не HTTP-код).
+  Причина: STRICT, нет sidecar.
+
+ШАГ 5. Инцидент 2: восстанавливаем и проверяем
+
+    k1 patch deployment -n bookinfo legacy-client --type=merge \
+      -p '{"spec":{"template":{"metadata":{"annotations":{"sidecar.istio.io/inject":"true"}}}}}'
+    k1 rollout restart deployment -n bookinfo legacy-client
+    k1 wait --for=condition=Ready pods -n bookinfo -l app=legacy-client --timeout=180s
+  ЗАЧЕМ: вернуть клиента в mesh; после перезапуска у пода появится istio-proxy.
+  ВЫ УВИДИТЕ: под legacy-client в статусе 2/2 Running.
+
+    LEGACY=$(k1 get pod -n bookinfo -l app=legacy-client -o jsonpath='{.items[0].metadata.name}')
+    k1 exec -n bookinfo "$LEGACY" -c istio-proxy -- \
+      curl -s -o /dev/null -w "%{http_code}\n" http://reviews:9080/reviews/1
+  ЗАЧЕМ: проверить исходную жалобу изнутри пода.
+  ВЫ УВИДИТЕ: 200.
+
+    k1 delete pod -n bookinfo mesh-client --ignore-not-found
+    bash ~/istio-course/incidents/simulate-8.1.sh --revert --incident 2
+  ЗАЧЕМ: снять STRICT и удалить тестовый под — стенд возвращается в baseline.
+  ВЫ УВИДИТЕ: "incident 2 reverted".
+
+  Если сервис нельзя подключить к mesh, альтернатива — PERMISSIVE для его namespace: это ослабляет
+  защиту, решение принимается осознанно и фиксируется в пост-мортеме.
+
+ШАГ 6. Инцидент 3: OOM sidecar — включаем и локализуем симптом
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --apply --incident 3
+  ЗАЧЕМ: скрипт ставит поду productpage аннотацию sidecar.istio.io/proxyMemoryLimit=32Mi,
+  перезапускает под и даёт нагрузку. Лимит ниже реального потребления Envoy.
+  ВЫ УВИДИТЕ: "incident 3 applied" и пересоздание пода productpage.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: зафиксировать, что видит пользователь при отказе единственного пода productpage.
+  ВЫ УВИДИТЕ: 503: у ingress gateway нет здорового эндпоинта.
+
+    k1 get pods -n bookinfo
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+    k1 describe pod -n bookinfo "$POD" | grep -A6 "Last State"
+  ЗАЧЕМ: узнать состояние пода и причину остановки контейнера.
+  ВЫ УВИДИТЕ: productpage-v1 в CrashLoopBackOff; Last State: Terminated, Reason: OOMKilled,
+  контейнер istio-proxy.
+
+    k1 get pod -n bookinfo "$POD" \
+      -o jsonpath='{.spec.containers[?(@.name=="istio-proxy")].resources.limits.memory}{"\n"}'
+    k1 get pod -n bookinfo "$POD" \
+      -o jsonpath='{.metadata.annotations.sidecar\.istio\.io/proxyMemoryLimit}{"\n"}'
+  ЗАЧЕМ: найти лимит и его источник — аннотацию пода, а не values установки.
+  ВЫ УВИДИТЕ: 32Mi в обоих выводах.
+
+  Запишите в заметки: контейнер istio-proxy убит по OOM, лимит задан аннотацией пода.
+  Причина: лимит памяти sidecar выставлен ниже фактического потребления Envoy.
+
+ШАГ 7. Инцидент 3: восстанавливаем и проверяем
+
+    k1 patch deployment -n bookinfo productpage-v1 --type=json \
+      -p '[{"op":"remove","path":"/spec/template/metadata/annotations/sidecar.istio.io~1proxyMemoryLimit"}]'
+    k1 rollout restart deployment -n bookinfo productpage-v1
+    k1 rollout status deployment -n bookinfo productpage-v1 --timeout=240s
+  ЗАЧЕМ: снять аннотацию и пересоздать под уже с нормальным лимитом.
+  ВЫ УВИДИТЕ: "deployment productpage-v1 successfully rolled out".
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+    bash ~/istio-course/incidents/simulate-8.1.sh --revert --incident 3
+  ЗАЧЕМ: подтвердить восстановление и снять нагрузку, которую создавал скрипт.
+  ВЫ УВИДИТЕ: 200 и "incident 3 reverted".
+
+ШАГ 8. Инцидент 4: istiod недоступен — включаем и локализуем симптом
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --apply --incident 4
+  ЗАЧЕМ: скрипт запоминает число реплик istiod и выставляет их в ноль. Это отказ control plane.
+  ВЫ УВИДИТЕ: "incident 4 applied".
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ЗАЧЕМ: главный вывод инцидента: data plane продолжает работать без control plane.
+  ВЫ УВИДИТЕ: 200 — трафик идёт по конфигурации, уже розданной прокси.
+
+    istioctl proxy-status
+    k1 get deployment -n istio-system
+  ЗАЧЕМ: увидеть, что штатная проверка перестала работать, и кто обслуживает control plane.
+  ВЫ УВИДИТЕ: ошибку подключения к istiod вместо таблицы статусов; у istiod-1-25 READY 0/0.
+
+    k1 delete pod -n bookinfo webhook-probe --ignore-not-found
+    k1 run webhook-probe --image=nginx:1.27 --restart=Never -n bookinfo
+  ЗАЧЕМ: проверить, что именно ломается при отсутствии istiod: webhook инъекции не отвечает.
+  ВЫ УВИДИТЕ: ошибку "failed calling webhook" или "context deadline exceeded"; под не создаётся.
+
+  Запишите в заметки: трафик жив, новые поды не создаются, proxy-status не работает.
+  Причина: control plane остановлен, webhook инъекции не отвечает.
+
+ШАГ 9. Инцидент 4: восстанавливаем и проверяем
+
+    bash ~/istio-course/incidents/simulate-8.1.sh --revert --incident 4
+    k1 wait --for=condition=Ready pods -n istio-system -l app=istiod --timeout=180s
+    istioctl proxy-status
+  ЗАЧЕМ: скрипт возвращает прежнее число реплик; дальше убеждаемся, что прокси снова на связи.
+  ВЫ УВИДИТЕ: "incident 4 reverted", под istiod-1-25 Running, поды bookinfo в статусе SYNC.
+
+    k1 delete pod -n bookinfo webhook-probe --ignore-not-found
+    k1 run webhook-probe --image=nginx:1.27 --restart=Never -n bookinfo
+    k1 wait --for=condition=Ready pods -n bookinfo -l run=webhook-probe --timeout=120s
+    k1 delete pod -n bookinfo webhook-probe
+  ЗАЧЕМ: проверить восстановление на том же действии, которое ломалось.
+  ВЫ УВИДИТЕ: под webhook-probe создаётся, переходит в Running и удаляется.
+
+ШАГ 10. Оформляем четыре пост-мортема
+
+    for f in 01-ca-rotation 02-strict-no-sidecar 03-oom-istio-proxy 04-istiod-down; do
+      cp ~/istio-course/incidents/postmortem-template.md ~/incidents/8.1-$f.md
+    done
+  ЗАЧЕМ: один шаблон на все инциденты — пост-мортемы читаются и сравниваются.
+  ВЫ УВИДИТЕ: четыре файла в ~/incidents.
+
+    vim ~/incidents/8.1-01-ca-rotation.md
+  ЗАЧЕМ: заполнить по своим заметкам; остальные три файла — так же.
+  Обязательные поля: хронология с временами, причина одной фразой, влияние на пользователей,
+  что сделали для восстановления, два-три action item. Причины для этой работы:
+  1) пересоздан корневой CA, часть подов осталась на сертификатах старого CA;
+  2) STRICT и под без sidecar; 3) лимит памяти sidecar ниже потребления Envoy;
+  4) остановлен istiod, webhook инъекции не отвечает.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Пять проверок:
+    k1 get pods -n bookinfo
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+    istioctl proxy-status | grep -c SYNC
+    ls -1 ~/incidents/8.1-*.md | wc -l
+  ВЫ УВИДИТЕ: поды 2/2 Running, HTTP 200, число SYNC равно числу подов с sidecar,
+  4 файла пост-мортемов и 1 в последней строке: поле причины заполнено.
+  ВЫ УВИДИТЕ: поды 2/2 Running, HTTP 200, число SYNC равно числу подов с sidecar, четыре файла.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: скрипт падает с сообщением про baseline или "secret not found"
+ПРИЧИНА: стенд не в baseline: другой namespace, нет istiod, не загружено окружение.
+ЧТО ДЕЛАТЬ:
+  1. Проверить: k1 get pods -n istio-system и k1 get pods -n bookinfo.
+  2. Если baseline разрушен — выполнить bash ~/istio-course/scripts/reset-istio.sh.
+  3. Повторить --apply; при повторной ошибке читать вывод скрипта целиком.
+
+ПРОБЛЕМА: после восстановления curl возвращает 200, но поды bookinfo 1/1
+ПРИЧИНА: инъекция не включена или метка namespace не та.
+ЧТО ДЕЛАТЬ:
+  1. Проверить метку: k1 get namespace bookinfo --show-labels.
+  2. Проверить, что ревизия жива: k1 get pods -n istio-system -l app=istiod.
+  3. Пересоздать поды: k1 rollout restart deployment -n bookinfo.
+
+ПРОБЛЕМА: в инциденте 3 под не уходит в OOM, лимит 32Mi держится
+ПРИЧИНА: у этой сборки Envoy потребление ниже; OOM — вероятностный сценарий, не гарантия.
+ЧТО ДЕЛАТЬ:
+  1. Проверить состояние: k1 get pods -n bookinfo и k1 describe pod | grep -A6 "Last State".
+  2. Повторить --apply --incident 3: скрипт добавит нагрузку.
+  3. Если OOM не наступил — разобрать инцидент по описанию шага 6 и записать в пост-мортем,
+     что порог в этой среде не достигается: это тоже результат наблюдения.
+
+ПРОБЛЕМА: в инциденте 1 у reviews тоже новые сертификаты, и 503 не воспроизводится
+ПРИЧИНА: поды reviews перезапускались после смены CA (вручную или автоскейлером).
+ЧТО ДЕЛАТЬ:
+  1. Повторить: --revert --incident 1, затем --apply --incident 1.
+  2. Проверить AGE и RESTARTS: k1 get pods -n bookinfo.
+  3. Убедиться, что старые поды не перезапускались после смены CA.
+
+ПРОБЛЕМА: в инциденте 4 под webhook-probe создался, хотя istiod выключен
+ПРИЧИНА: у webhook инъекции failurePolicy Ignore либо namespace без метки инъекции.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть политику: k1 get mutatingwebhookconfiguration -o yaml | grep failurePolicy.
+  2. Проверить метку namespace и описывать инцидент по фактическому поведению.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Возьмите любой из четырёх инцидентов и напишите playbook на 10 строк: первые три команды
+  диагностики, признак, подтверждающий причину, и безопасное действие восстановления.
+  Проверьте playbook на соседе: он должен по вашему тексту прийти к той же причине, не видя
+  ваших заметок. Если не пришёл — сократите шаги и уберите лишнее.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Почему proxy-status показывает SYNC и при этом трафик ломается? В каких инцидентах так было?
+  2. Чем отличается отказ из-за смены CA от истечения срока сертификата? Как отличить командами?
+  3. Почему при остановленном istiod существующий трафик работает? Что именно перестаёт работать?
+  4. Почему в инциденте 2 пользовательский трафик остался цел, а сломался только один клиент?
+  5. Какие два action item вы бы поставили после инцидента с лимитом памяти sidecar?
+
+УБОРКА
+  Все четыре инцидента откачены в шагах 3, 5, 7, 9. Проверяем baseline и отсутствие тестовых подов:
+    k1 get pods -n bookinfo
+    k1 get peerauthentication --all-namespaces
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: bookinfo 2/2, ни одной PeerAuthentication, istiod-1-25 1/1.
+  Пост-мортемы сдаются преподавателю.
+  Если стенд разошёлся — bash ~/istio-course/scripts/reset-istio.sh.
+
+ЧТО ДАЛЬШЕ
+  Теперь у вас есть маршрут диагностики и шаблон пост-мортема. В работе 8.2 причина не будет
+  названа: три мини-инцидента по 20–25 минут, инструменты и критерий готовности — остальное сами.

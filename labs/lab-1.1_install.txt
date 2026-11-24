@@ -1,0 +1,260 @@
+Лабораторная работа 1.1: Установка Istio и первое приложение
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        1. Инсталляция и архитектура
+РАБОТА:        1.1
+ДЛИТЕЛЬНОСТЬ:  90 минут
+СЛОЖНОСТЬ:     easy
+ТИП:           individual
+СОСТОЯНИЕ ДО:  cluster-1 собран, kubectl работает, istioctl 1.25.2 установлен (или ставится в шаге 0)
+СОСТОЯНИЕ ПОСЛЕ: Istio demo установлен, bookinfo развёрнут с sidecar, ingress gateway отвечает
+СЛЕДУЮЩАЯ:     lab-1.2_revisions.txt
+
+ЦЕЛИ РАБОТЫ
+  - Установить Istio профилем demo и проверить установку штатными средствами.
+  - Развернуть bookinfo с автоматической инъекцией sidecar и увидеть два контейнера в поде.
+  - Открыть приложение через Ingress Gateway и убедиться, что прокси синхронизированы с istiod.
+
+ЧТО МЫ СДЕЛАЕМ
+  Поставим Istio на cluster-1 профилем demo, развернём демонстрационное приложение bookinfo
+  с автоматической инъекцией sidecar, опубликуем его через Ingress Gateway и проверим
+  состояние data plane командой proxy-status. Это baseline всего курса: дальше мы будем
+  менять трафик, безопасность и наблюдаемость, не пересобирая стенд.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, кластер cluster-1 в состоянии Ready.
+  - istioctl 1.25.2 и дистрибутив ~/istio-1.25.2. На стенде из setup-guide они уже стоят;
+    если клиента нет — поставьте его в шаге 0.
+  - MetalLB в кластере (выдаёт внешний IP Ingress Gateway).
+  - Интернет нужен только для установки istioctl в шаге 0; на подготовленном стенде не требуется.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем кластер и инструменты:
+    k1 get nodes
+  ВЫ УВИДИТЕ: три узла control plane и два рабочих узла в статусе Ready.
+
+    istioctl version
+  ВЫ УВИДИТЕ: строку client version 1.25.2. Строки control plane пока нет — Istio ещё не установлен.
+
+    echo "$INGRESS_HOST"
+  ВЫ УВИДИТЕ: пустую строку. Так и должно быть: gateway появится после установки,
+  env.sh пересчитает адрес при следующем запуске.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Istio состоит из двух частей.
+
+  Control plane — один под istiod. Он следит за объектами Kubernetes (сервисы, поды,
+  наши будущие VirtualService и DestinationRule), собирает из них конфигурацию и рассылает
+  её по протоколу xDS всем прокси.
+
+  Data plane — sidecar-контейнер istio-proxy (Envoy) в каждом поде. Он перехватывает входящий
+  и исходящий трафик приложения и применяет то, что прислал istiod: маршруты, таймауты,
+  политики mTLS, сбор метрик.
+
+  Профиль установки — готовый набор компонентов. default — istiod и Ingress Gateway,
+  demo — то же плюс Egress Gateway, minimal — только istiod. Профили нужны, чтобы не
+  собирать установку из десятков флагов вручную.
+
+  Инъекция sidecar бывает автоматической (метка на namespace) и ручной. В курсе мы используем
+  автоматическую: помечаем namespace, и все новые поды получают istio-proxy.
+
+ШАГ 0. Проверяем istioctl и при необходимости устанавливаем
+
+    istioctl version --remote=false
+  ВЫ УВИДЕТЕ: client version 1.25.2. На стенде из setup-guide клиент уже установлен — шаг
+  можно считать проверкой. Если команда не найдена, поставьте клиент (нужен интернет):
+
+    cd ~
+    curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=1.25.2 sh -
+    echo 'export PATH="$HOME/istio-1.25.2/bin:$PATH"' >> ~/.bashrc
+    export PATH="$HOME/istio-1.25.2/bin:$PATH"
+    istioctl version --remote=false
+
+  ЗАЧЕМ: istioctl — основной инструмент курса, а версия клиента должна совпадать с версией
+  control plane 1.25.2. Дистрибутив заодно содержит ~/istio-1.25.2/samples/ и
+  ~/istio-1.25.2/manifests/ — они понадобятся
+  в этой и следующих работах. Без интернета скачайте архив на другой машине и распакуйте в ~.
+  ВЫ УВИДЕТЕ: client version 1.25.2; строк control plane пока нет — Istio ещё не установлен.
+
+ШАГ 1. Смотрим доступные профили установки
+
+    ls ~/istio-1.25.2/manifests/profiles
+  ЗАЧЕМ: увидеть, из чего можно выбирать, прежде чем ставить. В Istio 1.25 команда
+  `istioctl profile` удалена, профили лежат файлами в дистрибутиве.
+  ВЫ УВИДИТЕ: 10 файлов: ambient.yaml, default.yaml, demo.yaml, empty.yaml, minimal.yaml,
+  openshift.yaml, openshift-ambient.yaml, preview.yaml, remote.yaml, stable.yaml.
+
+    istioctl manifest generate --set profile=demo | grep -E '^(kind|  name):' | head -20
+  ЗАЧЕМ: понять, что именно включает demo, а не верить описанию на слово.
+  ВЫ УВИДИТЕ: манифесты istiod, ingressGateway и egressGateway. Аддонов
+  (Prometheus, Grafana, Kiali, Jaeger) здесь нет — их мы поставим отдельно в работе 2.1.
+
+ШАГ 2. Устанавливаем Istio профилем demo
+
+    istioctl install --set profile=demo -y
+  ЗАЧЕМ: demo включает istiod, Ingress Gateway и Egress Gateway — минимум для всего курса,
+  включая работу про исходящий трафик.
+  ВЫ УВИДИТЕ: последовательность "installing ...", в конце "Installation complete".
+
+ШАГ 3. Проверяем установку
+
+    istioctl experimental precheck
+  ЗАЧЕМ: штатная проверка кластера перед установкой. В Istio 1.25 команда
+  `istioctl verify-install` удалена, поэтому установку проверяем precheck и подами.
+  ВЫ УВИДИТЕ: "No issues found when checking the cluster".
+
+    k1 get pods -n istio-system
+  ВЫ УВИДИТЕ: istiod-... 1/1 Running, istio-ingressgateway-... 1/1 Running,
+  istio-egressgateway-... 1/1 Running.
+
+ШАГ 4. Смотрим, какие CRD установил Istio
+
+    k1 get crd | grep istio | wc -l
+  ЗАЧЕМ: CRD — это те объекты, которыми мы будем управлять mesh'ем весь курс.
+  ВЫ УВИДИТЕ: число в диапазоне 13–18. Точное значение зависит от версии.
+
+    k1 get crd | grep istio | head -10
+  ВЫ УВИДИТЕ: virtualservices.networking.istio.io, destinationrules.networking.istio.io,
+  gateways.networking.istio.io и другие.
+
+ШАГ 5. Создаём namespace приложения и включаем инъекцию
+
+    k1 create namespace bookinfo
+
+    k1 label namespace bookinfo istio-injection=enabled
+  ЗАЧЕМ: метка говорит webhook'у istiod: все новые поды в этом namespace получают sidecar.
+  ВЫ УВИДИТЕ: "namespace/bookinfo labeled".
+
+ШАГ 6. Разворачиваем bookinfo
+
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/platform/kube/bookinfo.yaml -n bookinfo
+  ЗАЧЕМ: bookinfo — сквозное приложение курса: productpage, details, reviews (v1/v2/v3), ratings.
+  ВЫ УВИДИТЕ: список created: service/details, deployment.apps/details-v1, ... (8–10 объектов).
+
+    k1 wait --for=condition=Ready pods --all -n bookinfo --timeout=180s
+  ЗАЧЕМ: дождаться, пока все поды запустятся и пройдут readiness.
+  ВЫ УВИДИТЕ: "pod/... condition met" для каждого пода.
+
+    k1 get pods -n bookinfo
+  ВЫ УВИДИТЕ: у каждого пода READY 2/2: приложение и istio-proxy.
+
+ШАГ 7. Проверяем, что sidecar синхронизированы с control plane
+
+    istioctl proxy-status
+  ЗАЧЕМ: proxy-status — первая команда при любой проблеме в mesh'е.
+  ВЫ УВИДИТЕ: строки по каждому поду, в колонке SYNCED — "SYNC".
+
+    istioctl proxy-status | grep -c SYNC
+  ВЫ УВИДИТЕ: число, равное числу подов с sidecar.
+
+ШАГ 8. Публикуем приложение через Ingress Gateway
+
+    k1 apply -f ~/istio-1.25.2/samples/bookinfo/networking/bookinfo-gateway.yaml -n bookinfo
+  ЗАЧЕМ: Gateway открывает порт 80 на ingress gateway, VirtualService связывает его с productpage.
+  ВЫ УВИДИТЕ: gateway.networking.istio.io/bookinfo-gateway created,
+  virtualservice.networking.istio.io/bookinfo created.
+
+    k1 get gateway -n bookinfo
+  ВЫ УВИДИТЕ: bookinfo-gateway. В Istio 1.25 колонка HOSTS не выводится;
+  проверьте её так:
+    k1 get gateway bookinfo-gateway -n bookinfo -o jsonpath='{.spec.servers[0].hosts}'
+
+ШАГ 9. Обновляем окружение и получаем внешний адрес
+
+    source ~/istio-course/scripts/env.sh
+    echo "$INGRESS_HOST"
+  ЗАЧЕМ: env.sh пересчитывает адрес gateway при каждом запуске — после установки он появился.
+  ВЫ УВИДИТЕ: IP из пула MetalLB, например 192.168.56.240. Если пусто — см. раздел
+  "ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК".
+
+    curl -s "http://$INGRESS_HOST/productpage" | grep -o "<title>.*</title>"
+  ЗАЧЕМ: проверить полный путь: клиент -> ingress gateway -> productpage -> reviews -> ratings.
+  ВЫ УВИДИТЕ: <title>Simple Bookstore App</title>.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: 200.
+
+ШАГ 10. Смотрим конфигурацию одного sidecar
+
+    POD=$(k1 get pod -n bookinfo -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+
+    istioctl proxy-config clusters "$POD" -n bookinfo | grep reviews
+  ЗАЧЕМ: увидеть, что sidecar знает про сервис reviews и его версии.
+  ВЫ УВИДИТЕ: одну строку outbound|9080||reviews.bookinfo.svc.cluster.local.
+  Subsets v1-v3 появятся только после DestinationRule в работе 3.1.
+
+ПРОВЕРКА РЕЗУЛЬТАТА
+  Три проверки одновременно:
+    istioctl experimental precheck | tail -3
+    k1 get pods -n bookinfo -o jsonpath='{.items[*].spec.containers[*].name}'
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: установку завершённой, у каждого пода контейнеры app и istio-proxy, HTTP 200.
+
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: istioctl: command not found
+ПРИЧИНА: не загружено окружение или дистрибутив лежит в другом каталоге.
+ЧТО ДЕЛАТЬ:
+  1. Выполнить source ~/istio-course/scripts/env.sh.
+  2. Проверить, что каталог существует: ls -d ~/istio-1.25.2.
+  3. Если каталога нет — вернуться к setup-guide.md, раздел "Инструменты на admin".
+
+ПРОБЛЕМА: поды istiod или gateway в статусе Pending
+ПРИЧИНА: на узлах не хватает ресурсов или не готов CNI.
+ЧТО ДЕЛАТЬ:
+  1. Посмотреть события: k1 describe pod -n istio-system -l app=istiod | tail -20.
+  2. Проверить узлы: k1 get nodes.
+  3. Проверить, что Calico запущен: k1 get pods -n kube-system | grep calico.
+
+ПРОБЛЕМА: echo "$INGRESS_HOST" пустой, приложение недоступно
+ПРИЧИНА: MetalLB не выдал внешний IP сервису istio-ingressgateway.
+ЧТО ДЕЛАТЬ:
+  1. Проверить сервис: k1 get svc -n istio-system istio-ingressgateway.
+  2. Если EXTERNAL-IP в статусе <pending> — проверить MetalLB: k1 get pods -n metallb-system.
+  3. Пока MetalLB не настроен, проверить можно через port-forward:
+     k1 port-forward -n istio-system svc/istio-ingressgateway 8080:80
+     и в другом терминале curl -s localhost:8080/productpage. Это временная проверка,
+     для следующих работ нужен MetalLB.
+
+ПРОБЛЕМА: у подов bookinfo READY 1/1, sidecar не появился
+ПРИЧИНА: namespace помечен позже, чем создавались поды, либо метка не та.
+ЧТО ДЕЛАТЬ:
+  1. Проверить метку: k1 get namespace bookinfo --show-labels.
+  2. Пересоздать поды: k1 rollout restart deployment -n bookinfo.
+  3. Снова проверить: k1 get pods -n bookinfo.
+
+ПРОБЛЕМА: curl возвращает 503
+ПРИЧИНА: поды productpage не готовы либо VirtualService не создан.
+ЧТО ДЕЛАТЬ:
+  1. k1 get pods -n bookinfo — все ли Running и Ready.
+  2. k1 get virtualservice -n bookinfo — есть ли bookinfo.
+  3. istioctl analyze -n bookinfo — покажет ошибки конфигурации.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Посмотрите, чем профиль minimal отличается от demo, и ответьте: что из этой лабораторной
+  перестанет работать, если установить minimal. Проверьте себя командой:
+    diff <(istioctl manifest generate --set profile=minimal) \
+         <(istioctl manifest generate --set profile=demo) | head -40
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем отличается control plane от data plane в Istio?
+  2. Что делает istiod и по какому протоколу он общается с Envoy?
+  3. Зачем нужна метка istio-injection=enabled на namespace?
+  4. Что показывает команда istioctl proxy-status и какой статус считается нормой?
+  5. Почему аддоны (Prometheus, Grafana, Kiali) не входят в профиль demo?
+
+УБОРКА
+  Ничего не удаляем. Это baseline курса: Istio demo, bookinfo с sidecar и ingress gateway
+  нужны всем следующим работам. Убеждаемся, что стенд здоров:
+    k1 get pods -n istio-system
+    k1 get pods -n bookinfo
+    echo "$INGRESS_HOST"
+
+ЧТО ДАЛЬШЕ
+  Мы поставили Istio и увидели, как sidecar получает конфигурацию. В работе 1.2 переставим
+  control plane через Helm, поставим рядом вторую ревизию и потренируемся обновлять и
+  откатывать mesh без простоя сервисов.

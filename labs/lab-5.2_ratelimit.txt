@@ -1,0 +1,420 @@
+Лабораторная работа 5.2: Rate limiting в Envoy и Lua-фильтры
+
+КУРС:          Istio для эксплуатации
+МОДУЛЬ:        5. Istio как API Gateway
+РАБОТА:        5.2
+ДЛИТЕЛЬНОСТЬ:  120 минут
+СЛОЖНОСТЬ:     hard
+ТИП:           individual
+СОСТОЯНИЕ ДО:  baseline Istio 1.25.2, приложение httpbin не развёрнуто
+СОСТОЯНИЕ ПОСЛЕ: httpbin и EnvoyFilter удалены, baseline не изменён
+СЛЕДУЮЩАЯ:     lab-5.3_egress.txt
+
+ЦЕЛИ РАБОТЫ
+  - Ограничить частоту запросов локально в Envoy и увидеть 429 после лимита.
+  - Сделать глобальный rate limit через Redis и сервис envoyproxy/ratelimit.
+  - Добавить заголовок ответа Lua-фильтром и отличать 429 от 500.
+
+ЧТО МЫ СДЕЛАЕМ
+  Развернём httpbin и опубликуем его через Ingress Gateway. Включим локальный лимит
+  на самом gateway, затем поднимем Redis и сервис ratelimit и включим глобальный лимит
+  по дескриптору пути. В конце добавим свой заголовок Lua-фильтром.
+
+ЧТО ПОНАДОБИТСЯ
+  - Доступ к admin (10.0.2.5) по ssh, окружение из ~/istio-course/scripts/env.sh.
+  - cluster-1 с baseline: istiod, istio-ingressgateway, bookinfo в mesh.
+  - Интернет на узлах: скачиваются образы redis и envoyproxy/ratelimit.
+
+ПРОВЕРКА СТЕНДА
+  Открываем терминал на admin и загружаем окружение:
+    ssh engineer@10.0.2.5
+    source ~/istio-course/scripts/env.sh
+
+  Проверяем Istio, адрес gateway и отсутствие старых EnvoyFilter:
+    k1 get pods -n istio-system
+    echo "$INGRESS_HOST"
+  ВЫ УВИДИТЕ: istiod и istio-ingressgateway в 1/1 Running, IP MetalLB в переменной.
+
+    k1 get envoyfilter -n istio-system
+  ВЫ УВИДИТЕ: No resources found in istio-system namespace.
+
+ТЕОРИЯ ЗА 5 МИНУТ
+  Локальный лимит считает каждый прокси сам, по token bucket: max_tokens, tokens_per_fill
+  и fill_interval. Внешних сервисов нет, но лимит действует на каждый под gateway
+  отдельно. Глобальный лимит считает общий счётчик вне прокси: Envoy по gRPC просит
+  квоту у сервиса ratelimit (envoyproxy/ratelimit), тот хранит счётчики в Redis.
+  Лимиты описываются дескрипторами: domain и пары ключ/значение, например key PATH.
+
+  Оба варианта включаются через EnvoyFilter — вставку конфигурации Envoy в mesh.
+  Имена фильтров и поля patch берутся из API Envoy, а не Istio, поэтому после
+  обновления Istio такие фильтры перепроверяют. Для gateway patch применяется к
+  контексту GATEWAY и фильтру http_connection_manager.
+
+  Lua — фильтр envoy.filters.http.lua: код исполняется на запросе или ответе. В Envoy
+  1.33 поле inline_code устарело, код передаётся через default_source_code.
+
+ШАГ 1. Создаём namespace httpbin и разворачиваем приложение
+
+    k1 create namespace httpbin
+
+    k1 label namespace httpbin istio.io/rev=1-25
+  ЗАЧЕМ: метка ревизии включает автоматическую инъекцию sidecar для новых подов.
+  ВЫ УВИДИТЕ: namespace/httpbin labeled.
+
+    k1 apply -f ~/istio-1.25.2/samples/httpbin/httpbin.yaml -n httpbin
+
+    k1 wait --for=condition=Ready pods --all -n httpbin --timeout=120s
+
+    k1 get pods -n httpbin
+  ВЫ УВИДИТЕ: httpbin-... 2/2 Running — приложение и istio-proxy.
+
+ШАГ 2. Открываем httpbin через Gateway
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: httpbin-gateway
+  namespace: httpbin
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+  - port: {number: 80, name: http, protocol: HTTP}
+    hosts: ["*"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: httpbin-vs
+  namespace: httpbin
+spec:
+  hosts: ["*"]
+  gateways: [httpbin-gateway]
+  http:
+  - match: [{uri: {prefix: /api/}}]
+    rewrite: {uri: /}
+    route:
+    - destination: {host: httpbin.httpbin.svc.cluster.local, port: {number: 8000}}
+EOF
+  ЗАЧЕМ: gateway открывает порт 80, VirtualService публикует только путь /api.
+  ВЫ УВИДИТЕ: gateway.networking.istio.io/httpbin-gateway и virtualservice created.
+
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/api/get"
+  ВЫ УВИДИТЕ: 200.
+
+ШАГ 3. Локальный лимит: token bucket в gateway
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: local-ratelimit-httpbin
+  namespace: istio-system
+spec:
+  workloadSelector: {labels: {istio: ingressgateway}}
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.local_ratelimit
+        typed_config:
+          "@type": >-
+            type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+          stat_prefix: httpbin-local-ratelimit
+          token_bucket: {max_tokens: 5, tokens_per_fill: 5, fill_interval: 60s}
+          filter_enabled:
+            runtime_key: local_rate_limit_enabled
+            default_value: {numerator: 100, denominator: HUNDRED}
+          filter_enforced:
+            runtime_key: local_rate_limit_enforced
+            default_value: {numerator: 100, denominator: HUNDRED}
+          response_headers_to_add:
+          - {append: false, header: {key: x-local-rate-limit, value: "true"}}
+EOF
+  ЗАЧЕМ: фильтр вставляется перед router и считает запросы на подах gateway.
+  ВЫ УВИДИТЕ: envoyfilter.networking.istio.io/local-ratelimit-httpbin created.
+  ПРОВЕРИТЬ НА СТЕНДЕ: patch для GATEWAY собран по образцу глобального лимита из
+  документации 1.25; локальный пример документации показан для SIDECAR_INBOUND.
+
+    sleep 10
+
+    GW=$(k1 get pod -n istio-system -l istio=ingressgateway \
+      -o jsonpath='{.items[0].metadata.name}')
+
+    istioctl proxy-config listener "$GW" -n istio-system -o json |
+      grep -c '"name": "envoy.filters.http.local_ratelimit"'
+  ВЫ УВИДИТЕ: 1 — фильтр появился в цепочке фильтров. Без stat_prefix Envoy
+  отклоняет конфигурацию с LocalRateLimitValidationError, и LDS уходит в NACK.
+
+    for i in $(seq 1 7); do
+      curl -s -o /dev/null -w "%{http_code} " "http://$INGRESS_HOST/api/get"
+    done
+    echo
+  ВЫ УВИДИТЕ: 200 200 200 200 200 429 429 — ведро на 5 запросов исчерпано.
+
+    curl -s -o /dev/null -D - "http://$INGRESS_HOST/api/get" | grep -i x-local-rate-limit
+  ВЫ УВИДИТЕ: x-local-rate-limit: true.
+
+  Убираем локальный фильтр, чтобы 429 не мешал глобальному лимиту:
+    k1 delete envoyfilter local-ratelimit-httpbin -n istio-system
+    sleep 5
+
+ШАГ 4. Поднимаем инфраструктуру глобального лимита
+
+    k1 apply -n httpbin -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: ratelimit-config, namespace: httpbin}
+data:
+  config.yaml: |
+    domain: httpbin
+    descriptors:
+    - key: PATH
+      value: "/api/get"
+      rate_limit: {unit: minute, requests_per_unit: 2}
+    - key: PATH
+      rate_limit: {unit: minute, requests_per_unit: 100}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: httpbin}
+spec:
+  ports: [{name: redis, port: 6379}]
+  selector: {app: redis}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: httpbin}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.4-alpine
+        ports: [{containerPort: 6379}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ratelimit, namespace: httpbin}
+spec:
+  ports:
+  - {name: http-port, port: 8080, targetPort: 8080}
+  - {name: grpc-port, port: 8081, targetPort: 8081}
+  - {name: http-debug, port: 6070, targetPort: 6070}
+  selector: {app: ratelimit}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ratelimit, namespace: httpbin}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: ratelimit}}
+  template:
+    metadata: {labels: {app: ratelimit}}
+    spec:
+      containers:
+      - name: ratelimit
+        image: envoyproxy/ratelimit:30a4ce1a
+        command: ["/bin/ratelimit"]
+        env:
+        - {name: LOG_LEVEL, value: debug}
+        - {name: REDIS_SOCKET_TYPE, value: tcp}
+        - {name: REDIS_URL, value: redis:6379}
+        - {name: USE_STATSD, value: "false"}
+        - {name: RUNTIME_ROOT, value: /data}
+        - {name: RUNTIME_SUBDIRECTORY, value: ratelimit}
+        - {name: RUNTIME_WATCH_ROOT, value: "false"}
+        - {name: HOST, value: "::"}
+        - {name: GRPC_HOST, value: "::"}
+        ports: [{containerPort: 8080}, {containerPort: 8081}, {containerPort: 6070}]
+        # subPath: иначе ratelimit читает и config.yaml, и симлинк ..data/config.yaml
+        volumeMounts:
+        - {name: config-volume, mountPath: /data/ratelimit/config/config.yaml, subPath: config.yaml}
+      volumes:
+      - name: config-volume
+        configMap: {name: ratelimit-config}
+EOF
+  ЗАЧЕМ: конфиг лимитов и счётчик в Redis; на /api/get разрешено 2 запроса в минуту.
+  ratelimit слушает gRPC на 8081 и читает configmap при старте.
+  ВЫ УВИДИТЕ: configmap, сервисы и деплойменты redis и ratelimit созданы.
+
+    k1 rollout status deployment/redis -n httpbin --timeout=180s
+    k1 rollout status deployment/ratelimit -n httpbin --timeout=180s
+    k1 get pods -n httpbin
+  ВЫ УВИДИТЕ: три пода (httpbin, redis, ratelimit) с READY 2/2.
+
+ШАГ 5. Включаем глобальный лимит на gateway
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: ratelimit-httpbin
+  namespace: istio-system
+spec:
+  workloadSelector: {labels: {istio: ingressgateway}}
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.ratelimit
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+          domain: httpbin
+          failure_mode_deny: true
+          timeout: 10s
+          rate_limit_service:
+            grpc_service:
+              envoy_grpc:
+                cluster_name: outbound|8081||ratelimit.httpbin.svc.cluster.local
+                authority: ratelimit.httpbin.svc.cluster.local
+            transport_api_version: V3
+  - applyTo: VIRTUAL_HOST
+    match:
+      context: GATEWAY
+      routeConfiguration:
+        vhost:
+          name: ""
+          route: {action: ANY}
+    patch:
+      operation: MERGE
+      value:
+        rate_limits:
+        - actions:
+          - request_headers:
+              header_name: ":path"
+              descriptor_key: "PATH"
+EOF
+  ЗАЧЕМ: один объект, два патча: первый вставляет фильтр, второй задаёт дескриптор.
+  ВЫ УВИДИТЕ: envoyfilter.networking.istio.io/ratelimit-httpbin created.
+
+    sleep 10
+
+    for i in $(seq 1 3); do
+      curl -s -o /dev/null -w "%{http_code} " "http://$INGRESS_HOST/api/get"
+    done
+    echo
+  ВЫ УВИДИТЕ: 200 200 429 — при лимите 2 в минуту.
+ШАГ 6. Добавляем свой заголовок Lua-фильтром
+
+  Убираем глобальный лимит, чтобы 429 не мешал проверке заголовка:
+    k1 delete envoyfilter ratelimit-httpbin -n istio-system
+    sleep 5
+
+    k1 apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: lua-httpbin
+  namespace: istio-system
+spec:
+  workloadSelector: {labels: {istio: ingressgateway}}
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          default_source_code:
+            inline_string: |
+              function envoy_on_response(response_handle)
+                response_handle:headers():add("x-gateway-lua", "istio-1.25.2")
+              end
+EOF
+  ЗАЧЕМ: Lua-код выполняется в Envoy и добавляет заголовок в ответ.
+  ВЫ УВИДИТЕ: envoyfilter.networking.istio.io/lua-httpbin created.
+  ПРОВЕРИТЬ НА СТЕНДЕ: имя фильтра и поле default_source_code — из API Envoy 1.33;
+  отдельного примера в документации Istio для Lua нет.
+
+    sleep 10
+
+    curl -s -D - -o /dev/null "http://$INGRESS_HOST/api/get" | grep -i x-gateway-lua
+  ВЫ УВИДИТЕ: x-gateway-lua: istio-1.25.2.
+ПРОВЕРКА РЕЗУЛЬТАТА
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/api/get"
+    curl -s -D - -o /dev/null "http://$INGRESS_HOST/api/get" | grep -ci x-gateway-lua
+  ВЫ УВИДИТЕ: 200 и 1 — заголовок x-gateway-lua есть в каждом ответе.
+ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК
+
+ПРОБЛЕМА: глобальный лимит отвечает 500 вместо 429.
+ПРИЧИНА: фильтр не может получить квоту: сервис ratelimit недоступен, а при
+failure_mode_deny: true недоступность превращается в отказ.
+ЧТО ДЕЛАТЬ:
+  1. Проверить поды: k1 get pods -n httpbin -l app=ratelimit.
+  2. Посмотреть логи: k1 logs -n httpbin deploy/ratelimit --tail=20.
+  3. Сверить cluster_name в EnvoyFilter: outbound|8081||ratelimit.httpbin.svc.cluster.local.
+
+ПРОБЛЕМА: 429 не наступает, все запросы 200.
+ПРИЧИНА: EnvoyFilter не применился (не та метка селектора, не тот context), либо
+дескриптор не совпал: в конфиге value "/api/get", а :path приходит с query-строкой.
+ЧТО ДЕЛАТЬ:
+  1. Проверить фильтр: istioctl proxy-config listener "$GW" -n istio-system -o json
+     | grep -c ratelimit.
+  2. Смотреть логи ratelimit: там виден пришедший дескриптор.
+  3. Запросить ровно /api/get без параметров и завершающего слэша.
+
+ПРОБЛЕМА: заголовка x-gateway-lua нет в ответе.
+ПРИЧИНА: Lua-фильтр вставлен не в ту цепочку, либо в коде ошибка и Envoy его не
+применил.
+ЧТО ДЕЛАТЬ:
+  1. Проверить фильтр: istioctl proxy-config listener "$GW" -n istio-system -o json
+     | grep -c envoy.lua.
+  2. Смотреть логи: k1 logs -n istio-system -l istio=ingressgateway -c istio-proxy --tail=20.
+  3. Пересоздать: k1 delete envoyfilter lua-httpbin -n istio-system и apply снова.
+
+ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ
+  Сделайте лимит по пользователю: добавьте в configmap дескриптор с key USER и
+  лимитом 1 в минуту, а в EnvoyFilter замените action на request_headers с
+  header_name x-user и descriptor_key USER. Три запроса от alice дают 200, 200, 429.
+
+ВОПРОСЫ ДЛЯ САМОПРОВЕРКИ
+  1. Чем локальный rate limit отличается от глобального и когда нужен каждый?
+  2. Что произойдёт, если filter_enabled 100, а filter_enforced 0?
+  3. Зачем в глобальном лимите два configPatches, а не один?
+  4. Почему при failure_mode_deny: true падение ratelimit возвращает 500, а не 429?
+  5. Почему Lua-фильтр считают рискованным для эксплуатации?
+УБОРКА
+  Удаляем namespace приложения: вместе с ним уходят httpbin, Redis и ratelimit.
+  Затем убираем EnvoyFilter из istio-system:
+    k1 delete namespace httpbin
+    k1 delete envoyfilter lua-httpbin -n istio-system
+
+  Убеждаемся, что baseline вернулся:
+    k1 get envoyfilter -n istio-system
+    curl -s -o /dev/null -w "%{http_code}\n" "http://$INGRESS_HOST/productpage"
+  ВЫ УВИДИТЕ: No resources found и 200.
+ЧТО ДАЛЬШЕ
+  Мы ограничили частоту запросов и научились вставлять свои фильтры в Envoy. В работе
+  5.3 посмотрим на трафик в обратную сторону: выпустим его наружу только через egress
+  gateway, включим TLS origination и ограничим политикой по service account.
